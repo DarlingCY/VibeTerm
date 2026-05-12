@@ -1,7 +1,10 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use std::{
     env,
     path::{Path, PathBuf},
     sync::mpsc::{channel, Receiver},
+    thread,
 };
 
 use anyhow::Result;
@@ -10,6 +13,7 @@ use egui_term::{
     BackendSettings, ColorPalette, FontSettings, PtyEvent, TerminalBackend, TerminalFont,
     TerminalTheme, TerminalView,
 };
+use semver::Version;
 use serde::{Deserialize, Serialize};
 
 #[allow(dead_code)]
@@ -316,6 +320,7 @@ struct Pane {
     backend: TerminalBackend,
     receiver: Receiver<(u64, PtyEvent)>,
     exited: bool,
+    last_terminal_size: Option<egui::Vec2>,
 }
 
 // ============ Shell Profile ============
@@ -325,6 +330,112 @@ struct ShellProfile {
     name: String,
     program: String,
     args: Vec<String>,
+}
+
+// ============ Update Check ============
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+const GITHUB_RELEASE_API: &str = "https://api.github.com/repos/DarlingCY/VibeTerm/releases/latest";
+
+#[derive(Debug, Clone)]
+struct GitHubRelease {
+    tag_name: String,
+    html_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum UpdateStatus {
+    Idle,
+    Checking,
+    UpToDate(String),
+    UpdateAvailable { version: String, url: String },
+    Error(String),
+}
+
+struct UpdateChecker {
+    status: UpdateStatus,
+    receiver: Option<Receiver<Result<GitHubRelease, String>>>,
+}
+
+impl Default for UpdateChecker {
+    fn default() -> Self {
+        Self {
+            status: UpdateStatus::Idle,
+            receiver: None,
+        }
+    }
+}
+
+impl UpdateChecker {
+    fn check_for_updates(&mut self) {
+        if self.status == UpdateStatus::Checking {
+            return;
+        }
+        self.status = UpdateStatus::Checking;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.receiver = Some(rx);
+
+        thread::spawn(move || {
+            let result = fetch_latest_release();
+            let _ = tx.send(result);
+        });
+    }
+
+    fn poll(&mut self) {
+        if let Some(ref rx) = self.receiver {
+            if let Ok(result) = rx.try_recv() {
+                self.receiver = None;
+                match result {
+                    Ok(release) => {
+                        let current = parse_version(VERSION);
+                        let latest = parse_version(&release.tag_name);
+                        if let (Some(current), Some(latest)) = (current, latest) {
+                            if latest > current {
+                                self.status = UpdateStatus::UpdateAvailable {
+                                    version: release.tag_name,
+                                    url: release.html_url,
+                                };
+                            } else {
+                                self.status = UpdateStatus::UpToDate(format!("v{}", VERSION));
+                            }
+                        } else {
+                            self.status = UpdateStatus::Error("Invalid version format".to_string());
+                        }
+                    }
+                    Err(e) => {
+                        self.status = UpdateStatus::Error(e);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn parse_version(s: &str) -> Option<Version> {
+    let s = s.trim_start_matches('v');
+    Version::parse(s).ok()
+}
+
+fn fetch_latest_release() -> Result<GitHubRelease, String> {
+    let response = ureq::get(GITHUB_RELEASE_API)
+        .set("User-Agent", "VibeTerm")
+        .call()
+        .map_err(|e| format!("Request failed: {}", e))?;
+
+    let json: serde_json::Value = response
+        .into_json()
+        .map_err(|e| format!("Failed to parse JSON: {}", e))?;
+
+    let tag_name = json["tag_name"]
+        .as_str()
+        .ok_or("Missing tag_name")?
+        .to_string();
+    let html_url = json["html_url"]
+        .as_str()
+        .ok_or("Missing html_url")?
+        .to_string();
+
+    Ok(GitHubRelease { tag_name, html_url })
 }
 
 // ============ Tab ============
@@ -354,6 +465,7 @@ struct App {
     startup_directory: Option<PathBuf>,
     show_settings: bool,
     terminal_theme: TerminalThemeType,
+    update_checker: UpdateChecker,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -400,6 +512,7 @@ impl App {
                 .into_iter()
                 .find(|t| t.name() == settings.terminal_theme)
                 .unwrap_or(TerminalThemeType::OneDarkPro),
+            update_checker: UpdateChecker::default(),
         };
         
         app.apply_theme(&cc.egui_ctx);
@@ -453,7 +566,7 @@ impl App {
             panes: Vec::new(),
             active_pane: 0,
         };
-        tab.panes.push(self.create_pane()?);
+        tab.panes.push(self.create_pane(None)?);
         self.tabs.push(tab);
         self.active_tab = self.tabs.len() - 1;
         Ok(())
@@ -462,7 +575,9 @@ impl App {
     fn set_shell(&mut self, index: usize) -> Result<()> {
         if index < self.shell_profiles.len() && index != self.active_shell {
             self.active_shell = index;
-            let new_pane = self.create_pane()?;
+            let initial_size = self.active_tab().panes.get(self.active_tab().active_pane)
+                .and_then(|pane| pane.last_terminal_size);
+            let new_pane = self.create_pane(initial_size)?;
             let tab = self.active_tab_mut();
             tab.panes[tab.active_pane] = new_pane;
         }
@@ -475,7 +590,9 @@ impl App {
             return Ok(());
         }
         
-        let pane = self.create_pane()?;
+        let initial_size = self.active_tab().panes.get(self.active_tab().active_pane)
+            .and_then(|pane| pane.last_terminal_size);
+        let pane = self.create_pane(initial_size)?;
         let tab = self.active_tab_mut();
         tab.panes.push(pane);
         tab.active_pane = tab.panes.len() - 1;
@@ -524,7 +641,7 @@ impl App {
         }
     }
     
-    fn create_pane(&mut self) -> Result<Pane> {
+    fn create_pane(&mut self, initial_size: Option<egui::Vec2>) -> Result<Pane> {
         let pane_id = self.next_pane_id as u64;
         self.next_pane_id += 1;
         
@@ -535,6 +652,7 @@ impl App {
             shell: shell.program.clone(),
             args: shell.args.clone(),
             working_directory: self.startup_directory.clone(),
+            initial_size: initial_size.map(|s| egui_term::Size::new(s.x, s.y)),
         };
         
         let backend = TerminalBackend::new(pane_id, self.egui_ctx.clone(), sender, settings)?;
@@ -544,6 +662,7 @@ impl App {
             backend,
             receiver,
             exited: false,
+            last_terminal_size: initial_size,
         })
     }
     
@@ -578,6 +697,9 @@ impl App {
         if !self.show_settings {
             return;
         }
+
+        // Poll for update check results
+        self.update_checker.poll();
 
         let mut open = self.show_settings;
         egui::Window::new("Settings")
@@ -665,6 +787,59 @@ impl App {
                             });
                     });
 
+                    ui.add_space(12.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+
+                    // Update check section
+                    ui.heading("Updates");
+                    ui.add_space(8.0);
+
+                    ui.horizontal(|ui| {
+                        ui.label(format!("Current version: v{}", VERSION));
+                    });
+                    ui.add_space(4.0);
+
+                    match &self.update_checker.status {
+                        UpdateStatus::Idle => {
+                            if ui.button("Check for updates").clicked() {
+                                self.update_checker.check_for_updates();
+                            }
+                        }
+                        UpdateStatus::Checking => {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label("Checking...");
+                            });
+                        }
+                        UpdateStatus::UpToDate(version) => {
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("✓").color(egui::Color32::from_rgb(152, 195, 121)));
+                                ui.label(format!("You're up to date ({})", version));
+                            });
+                            if ui.button("Check again").clicked() {
+                                self.update_checker.check_for_updates();
+                            }
+                        }
+                        UpdateStatus::UpdateAvailable { version, url } => {
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("↑").color(egui::Color32::from_rgb(229, 192, 123)));
+                                ui.label(format!("New version available: {}", version));
+                            });
+                            if ui.button("Open Release Page").clicked() {
+                                let _ = open_url(url);
+                            }
+                        }
+                        UpdateStatus::Error(msg) => {
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("✗").color(egui::Color32::from_rgb(224, 108, 117)));
+                                ui.label(format!("Error: {}", msg));
+                            });
+                            if ui.button("Retry").clicked() {
+                                self.update_checker.check_for_updates();
+                            }
+                        }
+                    }
                 });
             });
 
@@ -984,6 +1159,8 @@ impl eframe::App for App {
                             .set_theme(TerminalTheme::new(terminal_palette.clone()));
                         ui.add(view);
                     });
+                    // Save terminal size for future pane creation
+                    pane.last_terminal_size = Some(terminal_rect.size());
                     ui.painter().rect_stroke(
                         outer_rect,
                         pane_corner_radius,
@@ -1268,6 +1445,28 @@ fn startup_directory_from_args() -> Option<PathBuf> {
     }
 
     None
+}
+
+fn open_url(url: &str) -> Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", url])
+            .spawn()?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(url)
+            .spawn()?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(url)
+            .spawn()?;
+    }
+    Ok(())
 }
 
 // ============ Main ============
