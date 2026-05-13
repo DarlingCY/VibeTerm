@@ -9,6 +9,7 @@ use std::{
 
 use anyhow::Result;
 use eframe::egui;
+use egui::IconData;
 use egui_term::{
     BackendSettings, ColorPalette, FontSettings, PtyEvent, TerminalBackend, TerminalFont,
     TerminalTheme, TerminalView,
@@ -18,6 +19,7 @@ use serde::{Deserialize, Serialize};
 
 #[allow(dead_code)]
 const MAX_PANES: usize = 6;
+const APP_ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
 
 // ============ One Dark Pro Theme ============
 
@@ -399,7 +401,7 @@ impl UpdateChecker {
                                 self.status = UpdateStatus::UpToDate(format!("v{}", VERSION));
                             }
                         } else {
-                            self.status = UpdateStatus::Error("Invalid version format".to_string());
+                            self.status = UpdateStatus::Error("版本号格式无效".to_string());
                         }
                     }
                     Err(e) => {
@@ -420,19 +422,19 @@ fn fetch_latest_release() -> Result<GitHubRelease, String> {
     let response = ureq::get(GITHUB_RELEASE_API)
         .set("User-Agent", "VibeTerm")
         .call()
-        .map_err(|e| format!("Request failed: {}", e))?;
+        .map_err(|e| format!("请求失败：{}", e))?;
 
     let json: serde_json::Value = response
         .into_json()
-        .map_err(|e| format!("Failed to parse JSON: {}", e))?;
+        .map_err(|e| format!("解析响应失败：{}", e))?;
 
     let tag_name = json["tag_name"]
         .as_str()
-        .ok_or("Missing tag_name")?
+        .ok_or("缺少 tag_name 字段")?
         .to_string();
     let html_url = json["html_url"]
         .as_str()
-        .ok_or("Missing html_url")?
+        .ok_or("缺少 html_url 字段")?
         .to_string();
 
     Ok(GitHubRelease { tag_name, html_url })
@@ -702,7 +704,7 @@ impl App {
         self.update_checker.poll();
 
         let mut open = self.show_settings;
-        egui::Window::new("Settings")
+        egui::Window::new("设置")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -710,136 +712,145 @@ impl App {
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 ui.vertical(|ui| {
-                    ui.heading("Terminal Settings");
+                    ui.heading("终端设置");
                     ui.add_space(8.0);
 
-                    ui.horizontal(|ui| {
-                        ui.label("Shell");
-                        let current_shell = &self.shell_profiles[self.active_shell].name;
-                        egui::ComboBox::from_id_salt("settings_shell_selector")
-                            .selected_text(current_shell)
-                            .show_ui(ui, |ui| {
-                                let choices = self
-                                    .shell_profiles
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(i, profile)| (i, profile.name.clone()))
-                                    .collect::<Vec<_>>();
-                                for (i, name) in choices {
-                                    if ui.selectable_label(i == self.active_shell, name).clicked() {
-                                        let _ = self.set_shell(i);
-                                        ui.close_menu();
+                    egui::Grid::new("settings_grid")
+                        .num_columns(2)
+                        .spacing([40.0, 12.0])
+                        .show(ui, |ui| {
+                            ui.label("终端");
+                            let current_shell = &self.shell_profiles[self.active_shell].name;
+                            egui::ComboBox::from_id_salt("settings_shell_selector")
+                                .selected_text(current_shell)
+                                .width(150.0)
+                                .show_ui(ui, |ui| {
+                                    let choices = self
+                                        .shell_profiles
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(i, profile)| (i, profile.name.clone()))
+                                        .collect::<Vec<_>>();
+                                    for (i, name) in choices {
+                                        if ui.selectable_label(i == self.active_shell, name).clicked() {
+                                            let _ = self.set_shell(i);
+                                            ui.close_menu();
+                                        }
                                     }
-                                }
-                            });
-                    });
+                                });
+                            ui.end_row();
 
-                    ui.horizontal(|ui| {
-                        ui.label("Font");
-                        let current_font = self
-                            .fonts
-                            .get(self.selected_font)
-                            .map(|font| font.name.as_str())
-                            .unwrap_or("Monospace");
-                        egui::ComboBox::from_id_salt("settings_font_selector")
-                            .selected_text(current_font)
-                            .show_ui(ui, |ui| {
-                                let fonts = self
-                                    .fonts
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(i, font)| (i, font.name.clone()))
-                                    .collect::<Vec<_>>();
-                                for (i, name) in fonts {
-                                    if ui.selectable_label(i == self.selected_font, name).clicked() {
-                                        self.selected_font = i;
-                                        self.apply_font(ctx);
-                                        self.save_settings();
-                                        ui.close_menu();
+                            ui.label("字体");
+                            let current_font = self
+                                .fonts
+                                .get(self.selected_font)
+                                .map(|font| font.name.as_str())
+                                .unwrap_or("Monospace");
+                            egui::ComboBox::from_id_salt("settings_font_selector")
+                                .selected_text(current_font)
+                                .width(150.0)
+                                .show_ui(ui, |ui| {
+                                    let fonts = self
+                                        .fonts
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(i, font)| (i, font.name.clone()))
+                                        .collect::<Vec<_>>();
+                                    for (i, name) in fonts {
+                                        if ui.selectable_label(i == self.selected_font, name).clicked() {
+                                            self.selected_font = i;
+                                            self.apply_font(ctx);
+                                            self.save_settings();
+                                            ui.close_menu();
+                                        }
                                     }
-                                }
-                            });
-                    });
+                                });
+                            ui.end_row();
 
-                    ui.horizontal(|ui| {
-                        ui.label("Font size");
-                        if ui
-                            .add(egui::Slider::new(&mut self.font_size, 8.0..=32.0).text("pt"))
-                            .changed()
-                        {
-                            self.save_settings();
-                        }
-                    });
+                            ui.label("字号");
+                            if ui
+                                .add(egui::Slider::new(&mut self.font_size, 8.0..=32.0).text("pt"))
+                                .changed()
+                            {
+                                self.save_settings();
+                            }
+                            ui.end_row();
 
-                    ui.horizontal(|ui| {
-                        ui.label("Terminal Theme");
-                        let current_theme = self.terminal_theme.name();
-                        egui::ComboBox::from_id_salt("settings_theme_selector")
-                            .selected_text(current_theme)
-                            .show_ui(ui, |ui| {
-                                for theme in TerminalThemeType::all() {
-                                    if ui.selectable_label(theme == self.terminal_theme, theme.name()).clicked() {
-                                        self.terminal_theme = theme;
-                                        self.save_settings();
-                                        ui.close_menu();
+                            ui.label("终端主题");
+                            let current_theme = self.terminal_theme.name();
+                            egui::ComboBox::from_id_salt("settings_theme_selector")
+                                .selected_text(current_theme)
+                                .width(150.0)
+                                .show_ui(ui, |ui| {
+                                    for theme in TerminalThemeType::all() {
+                                        if ui.selectable_label(theme == self.terminal_theme, theme.name()).clicked() {
+                                            self.terminal_theme = theme;
+                                            self.save_settings();
+                                            ui.close_menu();
+                                        }
                                     }
-                                }
-                            });
-                    });
+                                });
+                            ui.end_row();
+                        });
 
-                    ui.add_space(12.0);
+                    ui.add_space(16.0);
                     ui.separator();
-                    ui.add_space(8.0);
+                    ui.add_space(12.0);
 
                     // Update check section
-                    ui.heading("Updates");
+                    ui.heading("更新");
                     ui.add_space(8.0);
 
-                    ui.horizontal(|ui| {
-                        ui.label(format!("Current version: v{}", VERSION));
-                    });
-                    ui.add_space(4.0);
+                    egui::Frame::new()
+                        .fill(egui::Color32::from_rgb(33, 37, 43)) // One Dark Pro lighter background for card
+                        .corner_radius(6.0)
+                        .inner_margin(egui::Margin::same(12))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.vertical(|ui| {
+                                    ui.label(format!("当前版本：v{}", VERSION));
+                                    match &self.update_checker.status {
+                                        UpdateStatus::Idle => {}
+                                        UpdateStatus::Checking => {
+                                            ui.horizontal(|ui| {
+                                                ui.spinner();
+                                                ui.label(egui::RichText::new("正在检查更新...").color(egui::Color32::from_gray(150)));
+                                            });
+                                        }
+                                        UpdateStatus::UpToDate(version) => {
+                                            ui.label(egui::RichText::new(format!("✓ 当前已是最新版本（{}）", version)).color(egui::Color32::from_rgb(152, 195, 121)));
+                                        }
+                                        UpdateStatus::UpdateAvailable { version, .. } => {
+                                            ui.label(egui::RichText::new(format!("↑ 发现新版本：{}", version)).color(egui::Color32::from_rgb(229, 192, 123)));
+                                        }
+                                        UpdateStatus::Error(msg) => {
+                                            ui.label(egui::RichText::new(format!("✗ 检查失败：{}", msg)).color(egui::Color32::from_rgb(224, 108, 117)));
+                                        }
+                                    }
+                                });
 
-                    match &self.update_checker.status {
-                        UpdateStatus::Idle => {
-                            if ui.button("Check for updates").clicked() {
-                                self.update_checker.check_for_updates();
-                            }
-                        }
-                        UpdateStatus::Checking => {
-                            ui.horizontal(|ui| {
-                                ui.spinner();
-                                ui.label("Checking...");
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    match &self.update_checker.status {
+                                        UpdateStatus::Idle | UpdateStatus::Error(_) => {
+                                            if ui.button("检查更新").clicked() {
+                                                self.update_checker.check_for_updates();
+                                            }
+                                        }
+                                        UpdateStatus::Checking => {}
+                                        UpdateStatus::UpToDate(_) => {
+                                            if ui.button("重新检查").clicked() {
+                                                self.update_checker.check_for_updates();
+                                            }
+                                        }
+                                        UpdateStatus::UpdateAvailable { url, .. } => {
+                                            if ui.button("打开发布页面").clicked() {
+                                                let _ = open_url(url);
+                                            }
+                                        }
+                                    }
+                                });
                             });
-                        }
-                        UpdateStatus::UpToDate(version) => {
-                            ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new("✓").color(egui::Color32::from_rgb(152, 195, 121)));
-                                ui.label(format!("You're up to date ({})", version));
-                            });
-                            if ui.button("Check again").clicked() {
-                                self.update_checker.check_for_updates();
-                            }
-                        }
-                        UpdateStatus::UpdateAvailable { version, url } => {
-                            ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new("↑").color(egui::Color32::from_rgb(229, 192, 123)));
-                                ui.label(format!("New version available: {}", version));
-                            });
-                            if ui.button("Open Release Page").clicked() {
-                                let _ = open_url(url);
-                            }
-                        }
-                        UpdateStatus::Error(msg) => {
-                            ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new("✗").color(egui::Color32::from_rgb(224, 108, 117)));
-                                ui.label(format!("Error: {}", msg));
-                            });
-                            if ui.button("Retry").clicked() {
-                                self.update_checker.check_for_updates();
-                            }
-                        }
-                    }
+                        });
                 });
             });
 
@@ -1469,13 +1480,28 @@ fn open_url(url: &str) -> Result<()> {
     Ok(())
 }
 
+fn load_app_icon() -> Result<IconData> {
+    let image = image::load_from_memory(APP_ICON_PNG)
+        .map_err(|e| anyhow::anyhow!("Failed to decode app icon: {e}"))?
+        .into_rgba8();
+    let (width, height) = image.dimensions();
+
+    Ok(IconData {
+        rgba: image.into_raw(),
+        width,
+        height,
+    })
+}
+
 // ============ Main ============
 
 fn main() -> Result<()> {
+    let app_icon = load_app_icon()?;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 800.0])
             .with_title("VibeTerm")
+            .with_icon(app_icon)
             .with_decorations(false),
         ..Default::default()
     };

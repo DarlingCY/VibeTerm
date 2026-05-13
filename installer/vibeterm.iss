@@ -22,6 +22,7 @@ AppSupportURL={#MyAppURL}
 AppUpdatesURL={#MyAppURL}
 DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
+SetupIconFile={#MySourceDir}\assets\icon.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 LicenseFile={#MySourceDir}\LICENSE
 ArchitecturesAllowed=x64compatible
