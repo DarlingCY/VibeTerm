@@ -25,6 +25,8 @@ use serde::{Deserialize, Serialize};
 
 const IPC_PORT: u16 = 15973;
 const IPC_HOST: &str = "127.0.0.1";
+const DEFAULT_WINDOW_WIDTH: f32 = 1200.0;
+const DEFAULT_WINDOW_HEIGHT: f32 = 800.0;
 
 // ============ IPC Commands ============
 
@@ -682,9 +684,17 @@ impl App {
         app.apply_theme(&cc.egui_ctx);
         app.apply_font(&cc.egui_ctx);
         
-        // Add initial tab
+        // Add initial tab with an estimated terminal size, so the first shell prompt
+        // doesn't wrap incorrectly before the first real resize arrives.
         app.add_tab_with_cwd(None)?;
         Ok(app)
+    }
+
+    fn estimated_initial_terminal_size(&self) -> egui::Vec2 {
+        // Approximate the first pane's terminal area before the first frame layout.
+        // This avoids starting the PTY with the default ~80-column width, which can
+        // cause long cwd prompts to wrap until the window is resized.
+        egui::vec2(DEFAULT_WINDOW_WIDTH - 6.0, DEFAULT_WINDOW_HEIGHT - 38.0 - 24.0 - 4.0)
     }
     
     fn apply_theme(&self, ctx: &egui::Context) {
@@ -756,13 +766,19 @@ impl App {
     fn add_tab_with_cwd(&mut self, cwd: Option<PathBuf>) -> Result<()> {
         let tab_id = self.next_tab_id;
         self.next_tab_id += 1;
+        let initial_size = self
+            .tabs
+            .get(self.active_tab)
+            .and_then(|tab| tab.panes.get(tab.active_pane))
+            .and_then(|pane| pane.last_terminal_size)
+            .or_else(|| Some(self.estimated_initial_terminal_size()));
         
         let mut tab = Tab {
             title: format!("Tab {}", tab_id),
             panes: Vec::new(),
             active_pane: 0,
         };
-        tab.panes.push(self.create_pane_with_cwd(None, cwd)?);
+        tab.panes.push(self.create_pane_with_cwd(initial_size, cwd)?);
         self.tabs.push(tab);
         self.active_tab = self.tabs.len() - 1;
         Ok(())

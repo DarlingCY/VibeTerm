@@ -29,7 +29,6 @@ foreach ($parentKey in @($backgroundParentKey, $directoryParentKey)) {
     New-ItemProperty -Path $parentKey -Name "MUIVerb" -Value "VibeTerm" -PropertyType String -Force | Out-Null
     New-ItemProperty -Path $parentKey -Name "Icon" -Value $ExePath -PropertyType String -Force | Out-Null
     New-ItemProperty -Path $parentKey -Name "Position" -Value "Top" -PropertyType String -Force | Out-Null
-    New-ItemProperty -Path $parentKey -Name "SubCommands" -Value "" -PropertyType String -Force | Out-Null
     
     # Create sub-menu entries
     # 1. Add to current tab (add-pane)
