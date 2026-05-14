@@ -343,6 +343,13 @@ const GITHUB_RELEASE_API: &str = "https://api.github.com/repos/DarlingCY/VibeTer
 struct GitHubRelease {
     tag_name: String,
     html_url: String,
+    assets: Vec<ReleaseAsset>,
+}
+
+#[derive(Debug, Clone)]
+struct ReleaseAsset {
+    name: String,
+    browser_download_url: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -350,20 +357,24 @@ enum UpdateStatus {
     Idle,
     Checking,
     UpToDate(String),
-    UpdateAvailable { version: String, url: String },
+    UpdateAvailable { version: String, url: String, installer_url: Option<String> },
+    Downloading { version: String, progress: f32 },
+    LaunchingInstaller,
     Error(String),
 }
 
 struct UpdateChecker {
     status: UpdateStatus,
-    receiver: Option<Receiver<Result<GitHubRelease, String>>>,
+    check_receiver: Option<Receiver<Result<GitHubRelease, String>>>,
+    download_receiver: Option<Receiver<Result<PathBuf, String>>>,
 }
 
 impl Default for UpdateChecker {
     fn default() -> Self {
         Self {
             status: UpdateStatus::Idle,
-            receiver: None,
+            check_receiver: None,
+            download_receiver: None,
         }
     }
 }
@@ -375,7 +386,7 @@ impl UpdateChecker {
         }
         self.status = UpdateStatus::Checking;
         let (tx, rx) = std::sync::mpsc::channel();
-        self.receiver = Some(rx);
+        self.check_receiver = Some(rx);
 
         thread::spawn(move || {
             let result = fetch_latest_release();
@@ -383,19 +394,36 @@ impl UpdateChecker {
         });
     }
 
+    fn start_download(&mut self, version: String, url: String) {
+        if matches!(self.status, UpdateStatus::Downloading { .. }) {
+            return;
+        }
+        self.status = UpdateStatus::Downloading { version, progress: 0.0 };
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.download_receiver = Some(rx);
+
+        thread::spawn(move || {
+            let result = download_installer(&url);
+            let _ = tx.send(result);
+        });
+    }
+
     fn poll(&mut self) {
-        if let Some(ref rx) = self.receiver {
+        // Poll check result
+        if let Some(ref rx) = self.check_receiver {
             if let Ok(result) = rx.try_recv() {
-                self.receiver = None;
+                self.check_receiver = None;
                 match result {
                     Ok(release) => {
                         let current = parse_version(VERSION);
                         let latest = parse_version(&release.tag_name);
                         if let (Some(current), Some(latest)) = (current, latest) {
                             if latest > current {
+                                let installer_url = find_windows_installer(&release.assets);
                                 self.status = UpdateStatus::UpdateAvailable {
                                     version: release.tag_name,
                                     url: release.html_url,
+                                    installer_url,
                                 };
                             } else {
                                 self.status = UpdateStatus::UpToDate(format!("v{}", VERSION));
@@ -410,12 +438,70 @@ impl UpdateChecker {
                 }
             }
         }
+
+        // Poll download result
+        if let Some(ref rx) = self.download_receiver {
+            if let Ok(result) = rx.try_recv() {
+                self.download_receiver = None;
+                match result {
+                    Ok(path) => {
+                        self.status = UpdateStatus::LaunchingInstaller;
+                        thread::spawn(move || {
+                            let _ = std::process::Command::new(&path).spawn();
+                        });
+                    }
+                    Err(e) => {
+                        self.status = UpdateStatus::Error(e);
+                    }
+                }
+            }
+        }
     }
 }
 
 fn parse_version(s: &str) -> Option<Version> {
     let s = s.trim_start_matches('v');
     Version::parse(s).ok()
+}
+
+fn find_windows_installer(assets: &[ReleaseAsset]) -> Option<String> {
+    // Priority: .exe installer (setup, install, etc.)
+    for asset in assets {
+        let name_lower = asset.name.to_lowercase();
+        if name_lower.ends_with(".exe") 
+            && (name_lower.contains("setup") 
+                || name_lower.contains("install")
+                || name_lower.contains("vibeterm")) {
+            return Some(asset.browser_download_url.clone());
+        }
+    }
+    // Fallback: any .exe file
+    for asset in assets {
+        if asset.name.to_lowercase().ends_with(".exe") {
+            return Some(asset.browser_download_url.clone());
+        }
+    }
+    None
+}
+
+fn download_installer(url: &str) -> Result<PathBuf, String> {
+    let temp_dir = std::env::temp_dir();
+    let filename = url.split('/').last().unwrap_or("installer.exe");
+    let dest_path = temp_dir.join(filename);
+
+    let response = ureq::get(url)
+        .set("User-Agent", "VibeTerm")
+        .call()
+        .map_err(|e| format!("下载请求失败：{}", e))?;
+
+    let mut reader = response.into_reader();
+    let mut file = std::fs::File::create(&dest_path)
+        .map_err(|e| format!("创建文件失败：{}", e))?;
+    
+    std::io::copy(&mut reader, &mut file)
+        .map_err(|e| format!("写入文件失败：{}", e))?;
+
+    Ok(dest_path)
 }
 
 fn fetch_latest_release() -> Result<GitHubRelease, String> {
@@ -437,7 +523,21 @@ fn fetch_latest_release() -> Result<GitHubRelease, String> {
         .ok_or("缺少 html_url 字段")?
         .to_string();
 
-    Ok(GitHubRelease { tag_name, html_url })
+    let assets: Vec<ReleaseAsset> = json["assets"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|a| {
+                    Some(ReleaseAsset {
+                        name: a["name"].as_str()?.to_string(),
+                        browser_download_url: a["browser_download_url"].as_str()?.to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(GitHubRelease { tag_name, html_url, assets })
 }
 
 // ============ Tab ============
@@ -533,6 +633,34 @@ impl App {
     
     fn apply_font(&self, ctx: &egui::Context) {
         let mut fonts = egui::FontDefinitions::default();
+
+        if cfg!(windows) {
+            for (name, file) in [
+                ("fallback_microsoft_yahei_ui", "msyh.ttc"),
+                ("fallback_microsoft_yahei", "msyhbd.ttc"),
+                ("fallback_simhei", "simhei.ttf"),
+                ("fallback_segoe_emoji", "seguiemj.ttf"),
+            ] {
+                let path = Path::new("C:\\Windows\\Fonts").join(file);
+                if let Ok(font_data) = std::fs::read(&path) {
+                    fonts.font_data.insert(
+                        name.to_owned(),
+                        egui::FontData::from_owned(font_data).into(),
+                    );
+                    fonts
+                        .families
+                        .entry(egui::FontFamily::Proportional)
+                        .or_default()
+                        .push(name.to_owned());
+                    fonts
+                        .families
+                        .entry(egui::FontFamily::Monospace)
+                        .or_default()
+                        .push(name.to_owned());
+                }
+            }
+        }
+
         if let Some(font_info) = self.fonts.get(self.selected_font) {
             if let Some(path) = &font_info.path {
                 if let Ok(font_data) = std::fs::read(path) {
@@ -823,14 +951,26 @@ impl App {
                                         UpdateStatus::UpdateAvailable { version, .. } => {
                                             ui.label(egui::RichText::new(format!("↑ 发现新版本：{}", version)).color(egui::Color32::from_rgb(229, 192, 123)));
                                         }
+                                        UpdateStatus::Downloading { version, .. } => {
+                                            ui.horizontal(|ui| {
+                                                ui.spinner();
+                                                ui.label(egui::RichText::new(format!("正在下载 {}...", version)).color(egui::Color32::from_gray(150)));
+                                            });
+                                        }
+                                        UpdateStatus::LaunchingInstaller => {
+                                            ui.horizontal(|ui| {
+                                                ui.spinner();
+                                                ui.label(egui::RichText::new("安装包已下载，正在启动安装程序...").color(egui::Color32::from_gray(150)));
+                                            });
+                                        }
                                         UpdateStatus::Error(msg) => {
-                                            ui.label(egui::RichText::new(format!("✗ 检查失败：{}", msg)).color(egui::Color32::from_rgb(224, 108, 117)));
+                                            ui.label(egui::RichText::new(format!("✗ {}", msg)).color(egui::Color32::from_rgb(224, 108, 117)));
                                         }
                                     }
                                 });
 
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    match &self.update_checker.status {
+                                    match &self.update_checker.status.clone() {
                                         UpdateStatus::Idle | UpdateStatus::Error(_) => {
                                             if ui.button("检查更新").clicked() {
                                                 self.update_checker.check_for_updates();
@@ -842,11 +982,22 @@ impl App {
                                                 self.update_checker.check_for_updates();
                                             }
                                         }
-                                        UpdateStatus::UpdateAvailable { url, .. } => {
-                                            if ui.button("打开发布页面").clicked() {
-                                                let _ = open_url(url);
+                                        UpdateStatus::UpdateAvailable { version, url, installer_url } => {
+                                            if installer_url.is_some() {
+                                                if ui.button("立即更新").clicked() {
+                                                    self.update_checker.start_download(
+                                                        version.clone(),
+                                                        installer_url.clone().unwrap(),
+                                                    );
+                                                }
+                                            } else {
+                                                if ui.button("打开发布页面").clicked() {
+                                                    let _ = open_url(url);
+                                                }
                                             }
                                         }
+                                        UpdateStatus::Downloading { .. } => {}
+                                        UpdateStatus::LaunchingInstaller => {}
                                     }
                                 });
                             });
