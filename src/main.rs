@@ -1708,7 +1708,13 @@ fn settings_path() -> std::path::PathBuf {
 
 fn startup_directory_from_args() -> Option<PathBuf> {
     let args = parse_cli_args();
-    args.cwd
+    args.cwd.or_else(default_startup_directory)
+}
+
+fn default_startup_directory() -> Option<PathBuf> {
+    env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(PathBuf::from))
 }
 
 // ============ IPC Functions ============

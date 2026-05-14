@@ -9,7 +9,7 @@ use egui::MouseWheelUnit;
 use egui::Shape;
 use egui::Widget;
 use egui::{Align2, Painter, Pos2, Rect, Response, Stroke, Vec2};
-use egui::{Id, PointerButton};
+use egui::{Id, PointerButton, ImeEvent};
 
 use crate::backend::BackendCommand;
 use crate::backend::TerminalBackend;
@@ -34,6 +34,7 @@ pub struct TerminalViewState {
     is_dragged: bool,
     scroll_pixels: f32,
     current_mouse_position_on_grid: TerminalGridPoint,
+    ime_enabled: bool,
 }
 
 pub struct TerminalView<'a> {
@@ -143,9 +144,37 @@ impl<'a> TerminalView<'a> {
         layout: &Response,
         state: &mut TerminalViewState,
     ) -> Self {
-        if !layout.has_focus() || !layout.contains_pointer() {
+        if !layout.has_focus() {
+            // Clear IME state when losing focus
+            if state.ime_enabled {
+                state.ime_enabled = false;
+                layout.ctx.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Ime(_))));
+            }
             return self;
         }
+
+        // Set IME output to enable IME input for terminal
+        let content = self.backend.sync();
+        let cell_height = content.terminal_size.cell_height as f32;
+        let cell_width = content.terminal_size.cell_width as f32;
+        let cursor_col = content.grid.cursor.point.column.0 as f32;
+        let cursor_line = content.grid.cursor.point.line.0 + content.grid.display_offset() as i32;
+        let cursor_x = layout.rect.min.x + cell_width * cursor_col;
+        let cursor_y = layout.rect.min.y + cell_height * cursor_line as f32;
+        
+        // Create cursor rect (thin vertical line at cursor position)
+        let cursor_rect = Rect::from_min_size(
+            Pos2::new(cursor_x, cursor_y),
+            Vec2::new(cell_width, cell_height),
+        );
+        
+        // Set IME output to enable IME
+        layout.ctx.output_mut(|o| {
+            o.ime = Some(egui::output::IMEOutput {
+                rect: layout.rect,
+                cursor_rect,
+            });
+        });
 
         let modifiers = layout.ctx.input(|i| i.modifiers);
         let events = layout.ctx.input(|i| i.events.clone());
@@ -157,12 +186,18 @@ impl<'a> TerminalView<'a> {
                 | egui::Event::Key { .. }
                 | egui::Event::Copy
                 | egui::Event::Paste(_) => {
-                    input_actions.push(process_keyboard_event(
-                        event,
-                        self.backend,
-                        &self.bindings_layout,
-                        modifiers,
-                    ))
+                    // Skip keyboard events when IME is active to avoid conflicts
+                    if !state.ime_enabled {
+                        input_actions.push(process_keyboard_event(
+                            event,
+                            self.backend,
+                            &self.bindings_layout,
+                            modifiers,
+                        ))
+                    }
+                },
+                egui::Event::Ime(ime_event) => {
+                    input_actions.push(process_ime_event(ime_event, state));
                 },
                 egui::Event::MouseWheel { unit, delta, .. } => input_actions
                     .push(process_mouse_wheel(
@@ -655,4 +690,35 @@ fn process_mouse_move(
     }
 
     actions
+}
+
+fn process_ime_event(
+    ime_event: ImeEvent,
+    state: &mut TerminalViewState,
+) -> InputAction {
+    match ime_event {
+        ImeEvent::Enabled => {
+            state.ime_enabled = true;
+            InputAction::Ignore
+        },
+        ImeEvent::Preedit(_) => {
+            // Terminal doesn't need to show preedit text UI
+            // Just keep IME enabled and wait for commit
+            InputAction::Ignore
+        },
+        ImeEvent::Commit(text) => {
+            state.ime_enabled = false;
+            if !text.is_empty() {
+                InputAction::BackendCall(BackendCommand::Write(
+                    text.as_bytes().to_vec(),
+                ))
+            } else {
+                InputAction::Ignore
+            }
+        },
+        ImeEvent::Disabled => {
+            state.ime_enabled = false;
+            InputAction::Ignore
+        },
+    }
 }
