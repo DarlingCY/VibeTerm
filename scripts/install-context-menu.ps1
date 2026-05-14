@@ -16,12 +16,12 @@ $ExePath = (Resolve-Path -LiteralPath $ExePath).Path
 
 $menuSpecs = @(
     @{
-        KeyName = "VibeTerm.AddPane"
+        KeyName = "VibeTermAddPane"
         Label = "VibeTerm：添加到当前 Tab（追加 Pane）"
         Action = "add-pane"
     },
     @{
-        KeyName = "VibeTerm.NewTab"
+        KeyName = "VibeTermNewTab"
         Label = "VibeTerm：新开 Tab 和 Pane"
         Action = "new-tab"
     }
