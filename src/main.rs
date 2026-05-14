@@ -2,12 +2,16 @@
 
 use std::{
     env,
+    io::{Read, Write},
+    net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     sync::mpsc::{channel, Receiver},
     thread,
+    time::Duration,
 };
 
 use anyhow::Result;
+use crossbeam_channel::{Receiver as IpcReceiver, unbounded};
 use eframe::egui;
 use egui::IconData;
 use egui_term::{
@@ -16,6 +20,60 @@ use egui_term::{
 };
 use semver::Version;
 use serde::{Deserialize, Serialize};
+
+// ============ IPC Constants ============
+
+const IPC_PORT: u16 = 15973;
+const IPC_HOST: &str = "127.0.0.1";
+
+// ============ IPC Commands ============
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum IpcCommand {
+    AddPane { cwd: Option<String> },
+    NewTab { cwd: Option<String> },
+}
+
+// ============ Command Line Args ============
+
+#[derive(Debug, Clone)]
+pub struct CliArgs {
+    pub cwd: Option<PathBuf>,
+    pub action: Option<String>,
+}
+
+fn parse_cli_args() -> CliArgs {
+    let args: Vec<String> = env::args().collect();
+    let mut cwd = None;
+    let mut action = None;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--cwd" => {
+                if i + 1 < args.len() {
+                    cwd = Some(PathBuf::from(&args[i + 1]));
+                    i += 1;
+                }
+            }
+            "--action" => {
+                if i + 1 < args.len() {
+                    action = Some(args[i + 1].clone());
+                    i += 1;
+                }
+            }
+            _ => {
+                // Legacy: first positional argument is treated as cwd
+                if cwd.is_none() && !args[i].starts_with('-') {
+                    cwd = Some(PathBuf::from(&args[i]));
+                }
+            }
+        }
+        i += 1;
+    }
+
+    CliArgs { cwd, action }
+}
 
 #[allow(dead_code)]
 const MAX_PANES: usize = 6;
@@ -568,6 +626,9 @@ struct App {
     show_settings: bool,
     terminal_theme: TerminalThemeType,
     update_checker: UpdateChecker,
+    
+    // IPC
+    ipc_receiver: IpcReceiver<IpcCommand>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -588,7 +649,7 @@ impl Default for AppSettings {
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>) -> Result<Self> {
+    fn new(cc: &eframe::CreationContext<'_>, ipc_receiver: IpcReceiver<IpcCommand>) -> Result<Self> {
         // Setup fonts
         let fonts = available_fonts();
         let settings = load_settings();
@@ -615,13 +676,14 @@ impl App {
                 .find(|t| t.name() == settings.terminal_theme)
                 .unwrap_or(TerminalThemeType::OneDarkPro),
             update_checker: UpdateChecker::default(),
+            ipc_receiver,
         };
         
         app.apply_theme(&cc.egui_ctx);
         app.apply_font(&cc.egui_ctx);
         
         // Add initial tab
-        app.add_tab()?;
+        app.add_tab_with_cwd(None)?;
         Ok(app)
     }
     
@@ -688,6 +750,10 @@ impl App {
     }
     
     fn add_tab(&mut self) -> Result<()> {
+        self.add_tab_with_cwd(None)
+    }
+    
+    fn add_tab_with_cwd(&mut self, cwd: Option<PathBuf>) -> Result<()> {
         let tab_id = self.next_tab_id;
         self.next_tab_id += 1;
         
@@ -696,7 +762,7 @@ impl App {
             panes: Vec::new(),
             active_pane: 0,
         };
-        tab.panes.push(self.create_pane(None)?);
+        tab.panes.push(self.create_pane_with_cwd(None, cwd)?);
         self.tabs.push(tab);
         self.active_tab = self.tabs.len() - 1;
         Ok(())
@@ -716,13 +782,17 @@ impl App {
     
     #[allow(dead_code)]
     fn add_pane(&mut self) -> Result<()> {
+        self.add_pane_with_cwd(None)
+    }
+    
+    fn add_pane_with_cwd(&mut self, cwd: Option<PathBuf>) -> Result<()> {
         if self.active_tab().panes.len() >= MAX_PANES {
             return Ok(());
         }
         
         let initial_size = self.active_tab().panes.get(self.active_tab().active_pane)
             .and_then(|pane| pane.last_terminal_size);
-        let pane = self.create_pane(initial_size)?;
+        let pane = self.create_pane_with_cwd(initial_size, cwd)?;
         let tab = self.active_tab_mut();
         tab.panes.push(pane);
         tab.active_pane = tab.panes.len() - 1;
@@ -772,16 +842,23 @@ impl App {
     }
     
     fn create_pane(&mut self, initial_size: Option<egui::Vec2>) -> Result<Pane> {
+        self.create_pane_with_cwd(initial_size, None)
+    }
+    
+    fn create_pane_with_cwd(&mut self, initial_size: Option<egui::Vec2>, cwd: Option<PathBuf>) -> Result<Pane> {
         let pane_id = self.next_pane_id as u64;
         self.next_pane_id += 1;
         
         let (sender, receiver) = channel();
         let shell = &self.shell_profiles[self.active_shell];
         
+        // Use provided cwd, fallback to startup_directory
+        let working_directory = cwd.or_else(|| self.startup_directory.clone());
+        
         let settings = BackendSettings {
             shell: shell.program.clone(),
             args: shell.args.clone(),
-            working_directory: self.startup_directory.clone(),
+            working_directory,
             initial_size: initial_size.map(|s| egui_term::Size::new(s.x, s.y)),
         };
         
@@ -800,6 +877,21 @@ impl App {
         let tab = self.active_tab_mut();
         if index < tab.panes.len() {
             tab.active_pane = index;
+        }
+    }
+
+    fn process_ipc_commands(&mut self) {
+        while let Ok(command) = self.ipc_receiver.try_recv() {
+            match command {
+                IpcCommand::AddPane { cwd } => {
+                    let cwd_path = cwd.map(PathBuf::from);
+                    let _ = self.add_pane_with_cwd(cwd_path);
+                }
+                IpcCommand::NewTab { cwd } => {
+                    let cwd_path = cwd.map(PathBuf::from);
+                    let _ = self.add_tab_with_cwd(cwd_path);
+                }
+            }
         }
     }
 
@@ -1011,6 +1103,9 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Process IPC commands
+        self.process_ipc_commands();
+        
         // Apply theme
         self.apply_theme(ctx);
         self.show_settings_window(ctx);
@@ -1596,17 +1691,63 @@ fn settings_path() -> std::path::PathBuf {
 }
 
 fn startup_directory_from_args() -> Option<PathBuf> {
-    let arg = env::args_os().nth(1)?;
-    let path = PathBuf::from(arg);
-    if path.is_dir() {
-        return Some(path);
-    }
+    let args = parse_cli_args();
+    args.cwd
+}
 
-    if path.is_file() {
-        return path.parent().map(Path::to_path_buf);
-    }
+// ============ IPC Functions ============
 
-    None
+fn try_bind_ipc_port() -> Option<TcpListener> {
+    TcpListener::bind((IPC_HOST, IPC_PORT)).ok()
+}
+
+fn send_ipc_command(command: &IpcCommand) -> bool {
+    let addr = format!("{}:{}", IPC_HOST, IPC_PORT);
+    if let Ok(mut stream) = TcpStream::connect_timeout(
+        &addr.parse().unwrap(),
+        Duration::from_millis(500),
+    ) {
+        let json = serde_json::to_string(command).unwrap_or_default();
+        if stream.write_all(json.as_bytes()).is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+fn start_ipc_server() -> (IpcReceiver<IpcCommand>, std::thread::JoinHandle<()>) {
+    let (sender, receiver) = unbounded();
+    
+    let handle = thread::spawn(move || {
+        if let Ok(listener) = TcpListener::bind((IPC_HOST, IPC_PORT)) {
+            listener.set_nonblocking(true).ok();
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_read_timeout(Some(Duration::from_millis(100))).ok();
+                        let mut buf = [0u8; 4096];
+                        if let Ok(n) = stream.read(&mut buf) {
+                            if n > 0 {
+                                if let Ok(json) = std::str::from_utf8(&buf[..n]) {
+                                    if let Ok(command) = serde_json::from_str::<IpcCommand>(json) {
+                                        let _ = sender.send(command);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => {
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                }
+            }
+        }
+    });
+    
+    (receiver, handle)
 }
 
 fn open_url(url: &str) -> Result<()> {
@@ -1647,6 +1788,52 @@ fn load_app_icon() -> Result<IconData> {
 // ============ Main ============
 
 fn main() -> Result<()> {
+    // Parse command line arguments
+    let cli_args = parse_cli_args();
+    
+    // Handle action if specified
+    if let Some(action) = &cli_args.action {
+        let command = match action.as_str() {
+            "add-pane" => IpcCommand::AddPane {
+                cwd: cli_args.cwd.map(|p| p.to_string_lossy().to_string()),
+            },
+            "new-tab" => IpcCommand::NewTab {
+                cwd: cli_args.cwd.map(|p| p.to_string_lossy().to_string()),
+            },
+            _ => {
+                // Unknown action, just start normally
+                return run_main_instance();
+            }
+        };
+        
+        // Try to send to existing instance
+        if send_ipc_command(&command) {
+            // Successfully sent, exit
+            return Ok(());
+        }
+        
+        // No existing instance, start as main instance
+        // The cwd will be used for initial tab/pane
+    }
+    
+    run_main_instance()
+}
+
+fn run_main_instance() -> Result<()> {
+    // Try to bind IPC port to become the main instance
+    let ipc_receiver = if let Some(_listener) = try_bind_ipc_port() {
+        // We are the main instance, start IPC server
+        let (receiver, _handle) = start_ipc_server();
+        receiver
+    } else {
+        // Port already bound, but we're starting as main anyway (fallback)
+        // Create a dummy receiver that never receives anything
+        let (sender, receiver) = unbounded();
+        // Drop sender so receiver never gets anything
+        std::mem::forget(sender);
+        receiver
+    };
+    
     let app_icon = load_app_icon()?;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -1660,7 +1847,7 @@ fn main() -> Result<()> {
     eframe::run_native(
         "VibeTerm",
         options,
-        Box::new(|cc| Ok(Box::new(App::new(cc)?))),
+        Box::new(|cc| Ok(Box::new(App::new(cc, ipc_receiver)?))),
     )
     .map_err(|e| anyhow::anyhow!("Failed to run application: {:?}", e))
 }

@@ -11,4 +11,4 @@ foreach ($key in $keys) {
     }
 }
 
-Write-Host "Removed Windows context menu: Open with VibeTerm"
+Write-Host "Removed Windows context menu for VibeTerm"
