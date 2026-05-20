@@ -273,7 +273,6 @@ fn default_keyboard_bindings() -> Vec<(Binding<InputKind>, BindingAction)> {
         ArrowRight, Modifiers::SHIFT | Modifiers::CTRL; BindingAction::Esc("\x1b[1;6C".into());
         A,        Modifiers::SHIFT | Modifiers::CTRL; BindingAction::Char('\x01');
         B,        Modifiers::SHIFT | Modifiers::CTRL; BindingAction::Char('\x02');
-        C,        Modifiers::SHIFT | Modifiers::CTRL; BindingAction::Char('\x03');
         D,        Modifiers::SHIFT | Modifiers::CTRL; BindingAction::Char('\x04');
         E,        Modifiers::SHIFT | Modifiers::CTRL; BindingAction::Char('\x05');
         F,        Modifiers::SHIFT | Modifiers::CTRL; BindingAction::Char('\x06');
@@ -292,7 +291,7 @@ fn default_keyboard_bindings() -> Vec<(Binding<InputKind>, BindingAction)> {
         S,        Modifiers::SHIFT | Modifiers::CTRL; BindingAction::Char('\x13');
         T,        Modifiers::SHIFT | Modifiers::CTRL; BindingAction::Char('\x14');
         U,        Modifiers::SHIFT | Modifiers::CTRL; BindingAction::Char('\x51');
-        V,        Modifiers::SHIFT | Modifiers::CTRL; BindingAction::Char('\x16');
+        // Reserved for platform copy/paste bindings on Windows/Linux.
         W,        Modifiers::SHIFT | Modifiers::CTRL; BindingAction::Char('\x17');
         X,        Modifiers::SHIFT | Modifiers::CTRL; BindingAction::Char('\x18');
         Y,        Modifiers::SHIFT | Modifiers::CTRL; BindingAction::Char('\x19');
@@ -332,8 +331,9 @@ fn platform_keyboard_bindings() -> Vec<(Binding<InputKind>, BindingAction)> {
 fn platform_keyboard_bindings() -> Vec<(Binding<InputKind>, BindingAction)> {
     generate_bindings!(
         KeyboardBinding;
-        C, Modifiers::SHIFT | Modifiers::COMMAND; BindingAction::Copy;
-        V, Modifiers::SHIFT | Modifiers::COMMAND; BindingAction::Paste;
+        // On Windows/Linux, Ctrl+Shift+C/V for copy/paste
+        C, Modifiers::SHIFT | Modifiers::CTRL; BindingAction::Copy;
+        V, Modifiers::SHIFT | Modifiers::CTRL; BindingAction::Paste;
     )
 }
 

@@ -10,6 +10,7 @@ use egui::Shape;
 use egui::Widget;
 use egui::{Align2, Painter, Pos2, Rect, Response, Stroke, Vec2};
 use egui::{Id, PointerButton, ImeEvent};
+use std::time::Duration;
 
 use crate::backend::BackendCommand;
 use crate::backend::TerminalBackend;
@@ -26,6 +27,7 @@ const EGUI_TERM_WIDGET_ID_PREFIX: &str = "egui_term::instance::";
 enum InputAction {
     BackendCall(BackendCommand),
     WriteToClipboard(String),
+    ReadFromClipboard,
     Ignore,
 }
 
@@ -35,6 +37,7 @@ pub struct TerminalViewState {
     scroll_pixels: f32,
     current_mouse_position_on_grid: TerminalGridPoint,
     ime_enabled: bool,
+    pending_clipboard_paste: bool,
 }
 
 pub struct TerminalView<'a> {
@@ -50,7 +53,10 @@ pub struct TerminalView<'a> {
 impl Widget for TerminalView<'_> {
     fn ui(self, ui: &mut egui::Ui) -> Response {
         let (layout, painter) =
-            ui.allocate_painter(self.size, egui::Sense::click());
+            ui.allocate_painter(
+                self.size,
+                egui::Sense::click().union(egui::Sense::drag()),
+            );
 
         let widget_id = self.widget_id;
         let mut state = ui.memory(|m| {
@@ -144,37 +150,43 @@ impl<'a> TerminalView<'a> {
         layout: &Response,
         state: &mut TerminalViewState,
     ) -> Self {
-        if !layout.has_focus() {
+        let has_focus = layout.has_focus();
+
+        if !has_focus {
             // Clear IME state when losing focus
             if state.ime_enabled {
                 state.ime_enabled = false;
                 layout.ctx.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Ime(_))));
             }
-            return self;
         }
 
-        // Set IME output to enable IME input for terminal
-        let content = self.backend.sync();
-        let cell_height = content.terminal_size.cell_height as f32;
-        let cell_width = content.terminal_size.cell_width as f32;
-        let cursor_col = content.grid.cursor.point.column.0 as f32;
-        let cursor_line = content.grid.cursor.point.line.0 + content.grid.display_offset() as i32;
-        let cursor_x = layout.rect.min.x + cell_width * cursor_col;
-        let cursor_y = layout.rect.min.y + cell_height * cursor_line as f32;
-        
-        // Create cursor rect (thin vertical line at cursor position)
-        let cursor_rect = Rect::from_min_size(
-            Pos2::new(cursor_x, cursor_y),
-            Vec2::new(cell_width, cell_height),
-        );
-        
-        // Set IME output to enable IME
-        layout.ctx.output_mut(|o| {
-            o.ime = Some(egui::output::IMEOutput {
-                rect: layout.rect,
-                cursor_rect,
+        if has_focus {
+            // Set IME output to enable IME input for terminal
+            let content = self.backend.sync();
+            let cell_height = content.terminal_size.cell_height as f32;
+            let cell_width = content.terminal_size.cell_width as f32;
+            let cursor_col = content.grid.cursor.point.column.0 as f32;
+            let cursor_line =
+                content.grid.cursor.point.line.0 + content.grid.display_offset() as i32;
+            let cursor_x = layout.rect.min.x + cell_width * cursor_col;
+            let cursor_y = layout.rect.min.y + cell_height * cursor_line as f32;
+
+            // Create cursor rect (thin vertical line at cursor position)
+            let cursor_rect = Rect::from_min_size(
+                Pos2::new(cursor_x, cursor_y),
+                Vec2::new(cell_width, cell_height),
+            );
+
+            // Set IME output to enable IME
+            // Use cursor_rect as the IME rect so candidate window follows cursor position
+            // (egui-winit uses ime.rect for set_ime_cursor_area on Windows)
+            layout.ctx.output_mut(|o| {
+                o.ime = Some(egui::output::IMEOutput {
+                    rect: cursor_rect,
+                    cursor_rect,
+                });
             });
-        });
+        }
 
         let modifiers = layout.ctx.input(|i| i.modifiers);
         let events = layout.ctx.input(|i| i.events.clone());
@@ -182,21 +194,58 @@ impl<'a> TerminalView<'a> {
             let mut input_actions = vec![];
 
             match event {
-                egui::Event::Text(_)
-                | egui::Event::Key { .. }
-                | egui::Event::Copy
-                | egui::Event::Paste(_) => {
-                    // Skip keyboard events when IME is active to avoid conflicts
-                    if !state.ime_enabled {
-                        input_actions.push(process_keyboard_event(
-                            event,
-                            self.backend,
-                            &self.bindings_layout,
-                            modifiers,
-                        ))
+                egui::Event::Text(_) => {
+                    if !has_focus {
+                        continue;
                     }
+                    input_actions.push(process_keyboard_event(
+                        event,
+                        self.backend,
+                        &self.bindings_layout,
+                        modifiers,
+                    ))
+                },
+                egui::Event::Copy => {
+                    // Ignore platform Ctrl/Cmd+C copy events so Ctrl+C remains
+                    // available to the terminal. Terminal copy is handled by the
+                    // explicit Ctrl+Shift+C binding below.
+                    continue;
+                },
+                egui::Event::Paste(_) => {
+                    if !has_focus || !state.pending_clipboard_paste {
+                        // Ignore platform Ctrl/Cmd+V paste events so Ctrl+V
+                        // remains available to the terminal. Terminal paste is
+                        // handled by the explicit Ctrl+Shift+V binding below.
+                        continue;
+                    }
+                    state.pending_clipboard_paste = false;
+                    input_actions.push(process_keyboard_event(
+                        event,
+                        self.backend,
+                        &self.bindings_layout,
+                        modifiers,
+                    ))
+                },
+                egui::Event::Key { .. } => {
+                    if !has_focus {
+                        continue;
+                    }
+                    // Skip raw key events while IME composition is active, but still
+                    // allow committed text (Event::Text / Ime::Commit) through.
+                    if state.ime_enabled {
+                        continue;
+                    }
+                    input_actions.push(process_keyboard_event(
+                        event,
+                        self.backend,
+                        &self.bindings_layout,
+                        modifiers,
+                    ))
                 },
                 egui::Event::Ime(ime_event) => {
+                    if !has_focus {
+                        continue;
+                    }
                     input_actions.push(process_ime_event(ime_event, state));
                 },
                 egui::Event::MouseWheel { unit, delta, .. } => input_actions
@@ -240,7 +289,13 @@ impl<'a> TerminalView<'a> {
                         self.backend.process_command(cmd);
                     },
                     InputAction::WriteToClipboard(data) => {
+                        copy_text_to_system_clipboard(&data);
                         layout.ctx.copy_text(data);
+                    },
+                    InputAction::ReadFromClipboard => {
+                        // Request paste from clipboard - this will trigger Event::Paste
+                        state.pending_clipboard_paste = true;
+                        layout.ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
                     },
                     InputAction::Ignore => {},
                 }
@@ -256,6 +311,11 @@ impl<'a> TerminalView<'a> {
         layout: &Response,
         painter: &Painter,
     ) {
+        let current_time = painter.ctx().input(|i| i.time);
+        if self.has_focus {
+            painter.ctx().request_repaint_after(Duration::from_millis(500));
+        }
+        
         let content = self.backend.sync();
         let layout_min = layout.rect.min;
         let layout_max = layout.rect.max;
@@ -291,7 +351,7 @@ impl<'a> TerminalView<'a> {
             let is_selected = content
                 .selectable_range
                 .is_some_and(|r| r.contains(indexed.point));
-            let is_hovered_hyperling =
+            let is_hovered_hyperlink =
                 content.hovered_hyperlink.as_ref().is_some_and(|r| {
                     r.contains(&indexed.point)
                         && r.contains(&state.current_mouse_position_on_grid)
@@ -331,7 +391,7 @@ impl<'a> TerminalView<'a> {
             }
 
             // Handle hovered hyperlink underline
-            if is_hovered_hyperling {
+            if is_hovered_hyperlink {
                 let underline_height = y + cell_height;
                 shapes.push(Shape::LineSegment {
                     points: [
@@ -342,17 +402,28 @@ impl<'a> TerminalView<'a> {
                 });
             }
 
-            // Handle cursor rendering
+            // Handle cursor rendering with blinking
             if content.grid.cursor.point == indexed.point {
                 let cursor_color = self.theme.get_color(content.cursor.fg);
-                shapes.push(Shape::Rect(RectShape::filled(
-                    Rect::from_min_size(
-                        Pos2::new(x, y),
-                        Vec2::new(cell_width, cell_height),
-                    ),
-                    CornerRadius::default(),
-                    cursor_color,
-                )));
+                
+                let show_cursor = if self.has_focus {
+                    let blink_period = 0.5;
+                    let blink_time = current_time % (2.0 * blink_period);
+                    blink_time < blink_period
+                } else {
+                    true
+                };
+                
+                if show_cursor {
+                    shapes.push(Shape::Rect(RectShape::filled(
+                        Rect::from_min_size(
+                            Pos2::new(x, y),
+                            Vec2::new(cell_width, cell_height),
+                        ),
+                        CornerRadius::default(),
+                        cursor_color,
+                    )));
+                }
             }
 
             // Draw text content
@@ -401,31 +472,17 @@ fn process_keyboard_event(
         egui::Event::Text(text) => {
             process_text_event(&text, modifiers, backend, bindings_layout)
         },
-        egui::Event::Paste(text) => InputAction::BackendCall(
-            #[cfg(not(any(target_os = "ios", target_os = "macos")))]
-            if modifiers.contains(Modifiers::COMMAND | Modifiers::SHIFT) {
-                BackendCommand::Write(text.as_bytes().to_vec())
-            } else {
-                // Hotfix - Send ^V when there's not selection on view.
-                BackendCommand::Write([0x16].to_vec())
-            },
-            #[cfg(any(target_os = "ios", target_os = "macos"))]
-            {
-                BackendCommand::Write(text.as_bytes().to_vec())
-            },
-        ),
+        egui::Event::Paste(text) => {
+            InputAction::BackendCall(BackendCommand::Write(
+                text.as_bytes().to_vec()
+            ))
+        },
         egui::Event::Copy => {
-            #[cfg(not(any(target_os = "ios", target_os = "macos")))]
-            if modifiers.contains(Modifiers::COMMAND | Modifiers::SHIFT) {
-                let content = backend.selectable_content();
-                InputAction::WriteToClipboard(content)
-            } else {
-                // Hotfix - Send ^C when there's not selection on view.
+            let content = backend.selectable_content();
+            if content.is_empty() {
+                // No selection - send ^C to terminal (consistent with BindingAction::Copy)
                 InputAction::BackendCall(BackendCommand::Write([0x3].to_vec()))
-            }
-            #[cfg(any(target_os = "ios", target_os = "macos"))]
-            {
-                let content = backend.selectable_content();
+            } else {
                 InputAction::WriteToClipboard(content)
             }
         },
@@ -500,6 +557,16 @@ fn process_keyboard_key(
         BindingAction::Esc(seq) => InputAction::BackendCall(
             BackendCommand::Write(seq.as_bytes().to_vec()),
         ),
+        BindingAction::Copy => {
+            let content = backend.selectable_content();
+            if content.is_empty() {
+                // No selection - send ^C to terminal
+                InputAction::BackendCall(BackendCommand::Write([0x3].to_vec()))
+            } else {
+                InputAction::WriteToClipboard(content)
+            }
+        },
+        BindingAction::Paste => InputAction::ReadFromClipboard,
         _ => InputAction::Ignore,
     }
 }
@@ -563,7 +630,9 @@ fn process_left_button(
     pressed: bool,
 ) -> InputAction {
     let terminal_mode = backend.last_content().terminal_mode;
-    if terminal_mode.intersects(TermMode::MOUSE_MODE) {
+    if terminal_mode.intersects(TermMode::MOUSE_MODE)
+        && !should_bypass_mouse_mode(modifiers)
+    {
         InputAction::BackendCall(BackendCommand::MouseReport(
             MouseButton::LeftButton,
             *modifiers,
@@ -664,7 +733,7 @@ fn process_mouse_move(
     if state.is_dragged {
         let terminal_mode = terminal_content.terminal_mode;
         let cmd = if terminal_mode.contains(TermMode::MOUSE_MOTION)
-            && modifiers.is_none()
+            && !should_bypass_mouse_mode(modifiers)
         {
             InputAction::BackendCall(BackendCommand::MouseReport(
                 MouseButton::LeftMove,
@@ -691,6 +760,20 @@ fn process_mouse_move(
 
     actions
 }
+
+fn should_bypass_mouse_mode(modifiers: &Modifiers) -> bool {
+    modifiers.shift
+}
+
+#[cfg(windows)]
+fn copy_text_to_system_clipboard(text: &str) {
+    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+        let _ = clipboard.set_text(text.to_owned());
+    }
+}
+
+#[cfg(not(windows))]
+fn copy_text_to_system_clipboard(_text: &str) {}
 
 fn process_ime_event(
     ime_event: ImeEvent,

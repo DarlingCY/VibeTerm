@@ -149,9 +149,13 @@ impl TerminalBackend {
         pty_event_proxy_sender: Sender<(u64, PtyEvent)>,
         settings: BackendSettings,
     ) -> Result<Self> {
+        set_windows_console_codepage_utf8();
+
         let pty_config = tty::Options {
             shell: Some(tty::Shell::new(settings.shell, settings.args)),
             working_directory: settings.working_directory,
+            #[cfg(target_os = "windows")]
+            escape_args: true,
             ..tty::Options::default()
         };
         let config = term::Config::default();
@@ -266,16 +270,9 @@ impl TerminalBackend {
     }
 
     pub fn selectable_content(&self) -> String {
-        let content = self.last_content();
-        let mut result = String::new();
-        if let Some(range) = content.selectable_range {
-            for indexed in content.grid.display_iter() {
-                if range.contains(indexed.point) {
-                    result.push(indexed.c);
-                }
-            }
-        }
-        result
+        let term = self.term.clone();
+        let term = term.lock();
+        term.selection_to_string().unwrap_or_default()
     }
 
     pub fn sync(&mut self) -> &RenderableContent {
@@ -540,6 +537,19 @@ impl TerminalBackend {
         x
     }
 }
+
+#[cfg(target_os = "windows")]
+fn set_windows_console_codepage_utf8() {
+    const CP_UTF8: u32 = 65001;
+
+    unsafe {
+        let _ = windows_sys::Win32::System::Console::SetConsoleCP(CP_UTF8);
+        let _ = windows_sys::Win32::System::Console::SetConsoleOutputCP(CP_UTF8);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn set_windows_console_codepage_utf8() {}
 
 /// Copied from alacritty/src/display/hint.rs:
 /// Iterate over all visible regex matches.

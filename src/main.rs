@@ -1,34 +1,59 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::{
-    env,
-    io::{Read, Write},
+    collections::BTreeSet,
+    env, fs,
+    io::{self, Read, Write},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
-    sync::mpsc::{channel, Receiver},
+    process::Command,
     thread,
     time::Duration,
 };
 
-use anyhow::Result;
-use crossbeam_channel::{Receiver as IpcReceiver, unbounded};
-use eframe::egui;
-use egui::IconData;
-use egui_term::{
-    BackendSettings, ColorPalette, FontSettings, PtyEvent, TerminalBackend, TerminalFont,
-    TerminalTheme, TerminalView,
-};
-use semver::Version;
+use anyhow::{anyhow, Context, Result};
+use arboard::Clipboard;
+use base64::{engine::general_purpose::STANDARD, Engine};
+use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
-
-// ============ IPC Constants ============
+#[cfg(target_os = "windows")]
+use tao::platform::windows::{IconExtWindows, WindowBuilderExtWindows, WindowExtWindows};
+use tao::{
+    dpi::{LogicalPosition, LogicalSize, PhysicalSize},
+    event::{ElementState, Event, WindowEvent},
+    event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy},
+    keyboard::{KeyCode, ModifiersState},
+    window::{Icon, Window, WindowBuilder},
+};
+#[cfg(target_os = "windows")]
+use wry::WebViewBuilderExtWindows;
+use wry::{Rect, WebView, WebViewBuilder};
 
 const IPC_PORT: u16 = 15973;
 const IPC_HOST: &str = "127.0.0.1";
-const DEFAULT_WINDOW_WIDTH: f32 = 1200.0;
-const DEFAULT_WINDOW_HEIGHT: f32 = 800.0;
+const GITHUB_REPOSITORY: &str = "DarlingCY/VibeTerm";
+const GITHUB_LATEST_RELEASE_API: &str =
+    "https://api.github.com/repos/DarlingCY/VibeTerm/releases/latest";
+const GITHUB_LATEST_RELEASE_PAGE: &str = "https://github.com/DarlingCY/VibeTerm/releases/latest";
+const UPDATE_USER_AGENT: &str = concat!("VibeTerm/", env!("CARGO_PKG_VERSION"));
+const DEFAULT_WINDOW_WIDTH: f64 = 1200.0;
+const DEFAULT_WINDOW_HEIGHT: f64 = 800.0;
+const DEFAULT_TERMINAL_FONT: &str = "Cascadia Mono, Cascadia Code, Consolas, monospace";
+const DEFAULT_TERMINAL_FONT_SIZE: u16 = 14;
+const MIN_TERMINAL_FONT_SIZE: u16 = 10;
+const MAX_TERMINAL_FONT_SIZE: u16 = 32;
+const MAX_PANES_PER_TAB: usize = 6;
+const XTERM_CSS: &str = include_str!("../assets/xterm/xterm.css");
+const XTERM_JS: &str = include_str!("../assets/xterm/xterm.js");
+const XTERM_ADDON_FIT_JS: &str = include_str!("../assets/xterm/addon-fit.js");
+const XTERM_ADDON_CLIPBOARD_JS: &str = include_str!("../assets/xterm/addon-clipboard.js");
 
-// ============ IPC Commands ============
+fn browser_global_script(script: &str) -> String {
+    format!(
+        "(function() {{\n  var module = undefined;\n  var exports = undefined;\n  var define = undefined;\n  var self = globalThis.self || globalThis;\n  var window = globalThis.window || globalThis;\n{}\n}}).call(globalThis);",
+        script
+    )
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum IpcCommand {
@@ -36,12 +61,1551 @@ pub enum IpcCommand {
     NewTab { cwd: Option<String> },
 }
 
-// ============ Command Line Args ============
-
 #[derive(Debug, Clone)]
 pub struct CliArgs {
     pub cwd: Option<PathBuf>,
     pub action: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ShellProfile {
+    #[allow(dead_code)]
+    name: String,
+    program: String,
+    args: Vec<String>,
+}
+
+struct TerminalSession {
+    master: Box<dyn MasterPty + Send>,
+    writer: Box<dyn Write + Send>,
+    killer: Box<dyn ChildKiller + Send + Sync>,
+    cols: u16,
+    rows: u16,
+}
+
+impl Drop for TerminalSession {
+    fn drop(&mut self) {
+        let _ = self.killer.kill();
+    }
+}
+
+struct PaneState {
+    id: u32,
+    cwd: Option<PathBuf>,
+    terminal: Option<TerminalSession>,
+    selection: String,
+    exited: bool,
+}
+
+struct TabState {
+    id: u32,
+    panes: Vec<PaneState>,
+    active_pane: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TerminalSettings {
+    #[serde(default = "default_terminal_font")]
+    font_family: String,
+    #[serde(default = "default_terminal_font_size")]
+    font_size: u16,
+}
+
+impl Default for TerminalSettings {
+    fn default() -> Self {
+        Self {
+            font_family: default_terminal_font(),
+            font_size: default_terminal_font_size(),
+        }
+    }
+}
+
+struct VibeTerm {
+    tabs: Vec<TabState>,
+    active_tab: usize,
+    shell_profiles: Vec<ShellProfile>,
+    active_shell: usize,
+    settings: TerminalSettings,
+    font_families: Vec<String>,
+    startup_directory: Option<PathBuf>,
+    next_tab_id: u32,
+    next_pane_id: u32,
+}
+
+#[derive(Debug)]
+enum AppEvent {
+    Frontend(String),
+    FrontendEvents(Vec<FrontendEvent>),
+    Ipc(IpcCommand),
+    PtyOutput {
+        pane_id: u32,
+        data_base64: String,
+    },
+    PtyExit {
+        pane_id: u32,
+        status: Option<String>,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+enum FrontendMessage {
+    Ready,
+    StartPane {
+        pane_id: u32,
+        cols: u16,
+        rows: u16,
+    },
+    Input {
+        pane_id: u32,
+        data: String,
+    },
+    Resize {
+        pane_id: u32,
+        cols: u16,
+        rows: u16,
+    },
+    UpdateSettings {
+        font_family: String,
+        font_size: u16,
+    },
+    CheckForUpdates {
+        manual: bool,
+    },
+    InstallUpdate {
+        version: String,
+        asset_url: String,
+        silent: bool,
+    },
+    SelectionChanged {
+        pane_id: u32,
+        text: String,
+    },
+    CopyToClipboard {
+        text: String,
+    },
+    PasteFromClipboard {
+        pane_id: u32,
+    },
+    NewTerminal {
+        cwd: Option<String>,
+    },
+    AddPane {
+        cwd: Option<String>,
+    },
+    NewTab {
+        cwd: Option<String>,
+    },
+    SelectTab {
+        tab_id: u32,
+    },
+    SelectPane {
+        pane_id: u32,
+    },
+    CloseTab {
+        tab_id: u32,
+    },
+    ClosePane {
+        pane_id: u32,
+    },
+    MinimizeWindow,
+    ToggleMaximizeWindow,
+    CloseWindow,
+    DragWindow,
+    FrontendError {
+        message: String,
+        source: Option<String>,
+        line: Option<u32>,
+        column: Option<u32>,
+        stack: Option<String>,
+    },
+}
+
+#[derive(Debug, Serialize)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+enum FrontendEvent {
+    Init {
+        max_panes_per_tab: usize,
+        app_version: String,
+        font_family: String,
+        font_size: u16,
+        font_families: Vec<String>,
+    },
+    TabCreated {
+        tab_id: u32,
+        title: String,
+    },
+    TabSelected {
+        tab_id: u32,
+    },
+    TabClosed {
+        tab_id: u32,
+    },
+    PaneCreated {
+        tab_id: u32,
+        pane_id: u32,
+        active: bool,
+        exited: bool,
+        cwd: Option<String>,
+    },
+    PaneSelected {
+        pane_id: u32,
+    },
+    PaneReset {
+        pane_id: u32,
+        cwd: Option<String>,
+    },
+    PaneClosed {
+        pane_id: u32,
+    },
+    Output {
+        pane_id: u32,
+        data_base64: String,
+    },
+    UpdateCheckStarted {
+        manual: bool,
+    },
+    UpdateAvailable {
+        current_version: String,
+        version: String,
+        html_url: String,
+        asset_url: Option<String>,
+        asset_name: Option<String>,
+        body: Option<String>,
+    },
+    UpdateNotAvailable {
+        current_version: String,
+        latest_version: String,
+    },
+    UpdateInstallStarted {
+        version: String,
+    },
+    UpdateInstallLaunched {
+        version: String,
+    },
+    UpdateError {
+        message: String,
+    },
+    Exit {
+        pane_id: u32,
+        status: Option<String>,
+    },
+    Status {
+        message: String,
+    },
+    Error {
+        message: String,
+    },
+}
+
+fn main() -> Result<()> {
+    let cli_args = parse_cli_args();
+
+    if let Some(action) = &cli_args.action {
+        let command = match action.as_str() {
+            "add-pane" => IpcCommand::AddPane {
+                cwd: cli_args
+                    .cwd
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().to_string()),
+            },
+            "new-tab" => IpcCommand::NewTab {
+                cwd: cli_args
+                    .cwd
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().to_string()),
+            },
+            _ => return run_main_instance(cli_args.cwd),
+        };
+
+        if send_ipc_command(&command) {
+            return Ok(());
+        }
+    }
+
+    run_main_instance(cli_args.cwd)
+}
+
+fn webview_bounds(window: &Window) -> Rect {
+    let size = window.inner_size().to_logical::<u32>(window.scale_factor());
+
+    Rect {
+        position: LogicalPosition::new(0, 0).into(),
+        size: LogicalSize::new(size.width, size.height).into(),
+    }
+}
+
+fn resize_webview_to_window(webview: &WebView, window: &Window) {
+    if let Err(error) = webview.set_bounds(webview_bounds(window)) {
+        eprintln!("failed to resize webview: {error}");
+    }
+
+    if let Err(error) = webview.evaluate_script("window.vibeTerm && window.vibeTerm.fitActive();") {
+        eprintln!("failed to fit visible panes: {error}");
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn icon_from_resource(size: u32) -> Option<Icon> {
+    let icon_size = Some(PhysicalSize::new(size, size));
+    Icon::from_resource(1, icon_size)
+        .ok()
+        .or_else(|| Icon::from_path(Path::new("assets").join("icon.ico"), icon_size).ok())
+}
+
+#[cfg(target_os = "windows")]
+fn apply_window_icons(window: &Window) {
+    let window_icon = icon_from_resource(32).or_else(|| icon_from_resource(16));
+    if window_icon.is_none() {
+        eprintln!("failed to load window icon resource");
+    }
+    window.set_window_icon(window_icon);
+
+    let taskbar_icon = icon_from_resource(256)
+        .or_else(|| icon_from_resource(128))
+        .or_else(|| icon_from_resource(64))
+        .or_else(|| icon_from_resource(48));
+    if taskbar_icon.is_none() {
+        eprintln!("failed to load taskbar icon resource");
+    }
+    window.set_taskbar_icon(taskbar_icon);
+}
+
+#[cfg(not(target_os = "windows"))]
+fn apply_window_icons(_window: &Window) {}
+
+fn run_main_instance(startup_directory: Option<PathBuf>) -> Result<()> {
+    let event_loop = EventLoopBuilder::<AppEvent>::with_user_event().build();
+    let proxy = event_loop.create_proxy();
+    start_ipc_server(proxy.clone());
+
+    let window_builder = WindowBuilder::new()
+        .with_title("VibeTerm")
+        .with_decorations(false)
+        .with_inner_size(LogicalSize::new(
+            DEFAULT_WINDOW_WIDTH,
+            DEFAULT_WINDOW_HEIGHT,
+        ));
+    #[cfg(target_os = "windows")]
+    let window_builder = window_builder.with_undecorated_shadow(true);
+
+    let window = window_builder
+        .build(&event_loop)
+        .context("failed to create window")?;
+    apply_window_icons(&window);
+
+    let ipc_proxy = proxy.clone();
+    let webview_builder = WebViewBuilder::new()
+        .with_bounds(webview_bounds(&window))
+        .with_incognito(true)
+        .with_clipboard(true);
+    #[cfg(target_os = "windows")]
+    let webview_builder = webview_builder.with_browser_accelerator_keys(false);
+    let webview = webview_builder
+        .with_html(index_html())
+        .with_navigation_handler(|url| url == "about:blank" || url.starts_with("data:"))
+        .with_ipc_handler(move |request| {
+            let _ = ipc_proxy.send_event(AppEvent::Frontend(request.body().clone()));
+        })
+        .with_devtools(cfg!(debug_assertions))
+        .build_as_child(&window)
+        .context("failed to create webview")?;
+    resize_webview_to_window(&webview, &window);
+
+    let mut app = VibeTerm::new(startup_directory);
+    let mut frontend_ready = false;
+    let mut pending_frontend_events = Vec::new();
+    let mut modifiers = ModifiersState::default();
+
+    event_loop.run(move |event, _, control_flow| {
+        let _ = &window;
+        *control_flow = ControlFlow::Wait;
+
+        match event {
+            Event::WindowEvent { event, .. } => match event {
+                WindowEvent::CloseRequested => {
+                    app.shutdown();
+                    *control_flow = ControlFlow::Exit;
+                }
+                WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
+                    resize_webview_to_window(&webview, &window);
+                }
+                WindowEvent::ModifiersChanged(new_modifiers) => {
+                    modifiers = new_modifiers;
+                }
+                WindowEvent::KeyboardInput { event, .. }
+                    if event.state == ElementState::Pressed
+                        && !event.repeat
+                        && modifiers.control_key()
+                        && modifiers.shift_key() =>
+                {
+                    let events = match event.physical_key {
+                        KeyCode::KeyC => app.copy_active_selection(),
+                        _ => Vec::new(),
+                    };
+                    emit_or_queue_frontend_events(
+                        &webview,
+                        frontend_ready,
+                        &mut pending_frontend_events,
+                        events,
+                    );
+                }
+                _ => {}
+            },
+            Event::UserEvent(AppEvent::FrontendEvents(events)) => emit_or_queue_frontend_events(
+                &webview,
+                frontend_ready,
+                &mut pending_frontend_events,
+                events,
+            ),
+            Event::UserEvent(AppEvent::Frontend(message)) => {
+                match serde_json::from_str::<FrontendMessage>(&message) {
+                    Ok(FrontendMessage::Ready) => {
+                        frontend_ready = true;
+                        emit_frontend_event(&webview, &app.init_event());
+                        if app.tabs.is_empty() {
+                            pending_frontend_events.extend(
+                                app.create_tab(app.startup_directory.clone(), proxy.clone()),
+                            );
+                        }
+                        for event in pending_frontend_events.drain(..) {
+                            emit_frontend_event(&webview, &event);
+                        }
+                    }
+                    Ok(FrontendMessage::MinimizeWindow) => {
+                        window.set_minimized(true);
+                    }
+                    Ok(FrontendMessage::ToggleMaximizeWindow) => {
+                        window.set_maximized(!window.is_maximized());
+                    }
+                    Ok(FrontendMessage::CloseWindow) => {
+                        app.shutdown();
+                        *control_flow = ControlFlow::Exit;
+                    }
+                    Ok(FrontendMessage::DragWindow) => {
+                        window.drag_window().ok();
+                    }
+                    Ok(FrontendMessage::ClosePane { pane_id }) => {
+                        let events = app.close_pane(pane_id);
+                        emit_or_queue_frontend_events(
+                            &webview,
+                            frontend_ready,
+                            &mut pending_frontend_events,
+                            events,
+                        );
+                    }
+                    Ok(message) => {
+                        let events = app.handle_frontend_message(message, proxy.clone());
+                        emit_or_queue_frontend_events(
+                            &webview,
+                            frontend_ready,
+                            &mut pending_frontend_events,
+                            events,
+                        );
+                    }
+                    Err(error) => emit_or_queue_frontend_events(
+                        &webview,
+                        frontend_ready,
+                        &mut pending_frontend_events,
+                        vec![FrontendEvent::Error {
+                            message: format!("Invalid frontend message: {error}"),
+                        }],
+                    ),
+                }
+            }
+            Event::UserEvent(AppEvent::Ipc(command)) => {
+                let events = match command {
+                    IpcCommand::AddPane { cwd } => {
+                        app.add_pane(cwd.map(PathBuf::from), proxy.clone())
+                    }
+                    IpcCommand::NewTab { cwd } => {
+                        app.create_tab(cwd.map(PathBuf::from), proxy.clone())
+                    }
+                };
+                emit_or_queue_frontend_events(
+                    &webview,
+                    frontend_ready,
+                    &mut pending_frontend_events,
+                    events,
+                );
+            }
+            Event::UserEvent(AppEvent::PtyOutput {
+                pane_id,
+                data_base64,
+            }) => emit_or_queue_frontend_events(
+                &webview,
+                frontend_ready,
+                &mut pending_frontend_events,
+                vec![FrontendEvent::Output {
+                    pane_id,
+                    data_base64,
+                }],
+            ),
+            Event::UserEvent(AppEvent::PtyExit { pane_id, status }) => {
+                let events = app.handle_pty_exit(pane_id, status);
+                emit_or_queue_frontend_events(
+                    &webview,
+                    frontend_ready,
+                    &mut pending_frontend_events,
+                    events,
+                );
+            }
+            _ => {}
+        }
+    });
+}
+
+impl VibeTerm {
+    fn new(startup_directory: Option<PathBuf>) -> Self {
+        Self {
+            tabs: Vec::new(),
+            active_tab: 0,
+            shell_profiles: available_shell_profiles(),
+            active_shell: 0,
+            settings: load_terminal_settings(),
+            font_families: system_font_families(),
+            startup_directory,
+            next_tab_id: 1,
+            next_pane_id: 1,
+        }
+    }
+
+    fn init_event(&self) -> FrontendEvent {
+        FrontendEvent::Init {
+            max_panes_per_tab: MAX_PANES_PER_TAB,
+            app_version: env!("CARGO_PKG_VERSION").to_owned(),
+            font_family: self.settings.font_family.clone(),
+            font_size: self.settings.font_size,
+            font_families: self.font_families.clone(),
+        }
+    }
+
+    fn handle_frontend_message(
+        &mut self,
+        message: FrontendMessage,
+        proxy: EventLoopProxy<AppEvent>,
+    ) -> Vec<FrontendEvent> {
+        match message {
+            FrontendMessage::Ready => Vec::new(),
+            FrontendMessage::StartPane {
+                pane_id,
+                cols,
+                rows,
+            } => self.start_pane(pane_id, cols, rows, proxy),
+            FrontendMessage::Input { pane_id, data } => {
+                if let Err(error) = self.write_to_pane(pane_id, data.as_bytes()) {
+                    return vec![FrontendEvent::Error {
+                        message: error.to_string(),
+                    }];
+                }
+                Vec::new()
+            }
+            FrontendMessage::Resize {
+                pane_id,
+                cols,
+                rows,
+            } => {
+                if let Err(error) = self.resize_pane(pane_id, cols, rows) {
+                    return vec![FrontendEvent::Error {
+                        message: error.to_string(),
+                    }];
+                }
+                Vec::new()
+            }
+            FrontendMessage::UpdateSettings {
+                font_family,
+                font_size,
+            } => {
+                self.update_settings(font_family, font_size);
+                Vec::new()
+            }
+            FrontendMessage::CheckForUpdates { manual } => {
+                check_for_updates(proxy, manual);
+                vec![FrontendEvent::UpdateCheckStarted { manual }]
+            }
+            FrontendMessage::InstallUpdate {
+                version,
+                asset_url,
+                silent,
+            } => {
+                install_update(proxy, version.clone(), asset_url, silent);
+                vec![FrontendEvent::UpdateInstallStarted { version }]
+            }
+            FrontendMessage::SelectionChanged { pane_id, text } => {
+                self.update_pane_selection(pane_id, text);
+                Vec::new()
+            }
+            FrontendMessage::CopyToClipboard { text } => copy_to_clipboard(text),
+            FrontendMessage::PasteFromClipboard { pane_id } => self.paste_from_clipboard(pane_id),
+            FrontendMessage::NewTerminal { cwd } => {
+                self.replace_active_pane(cwd.map(PathBuf::from), proxy)
+            }
+            FrontendMessage::AddPane { cwd } => self.add_pane(cwd.map(PathBuf::from), proxy),
+            FrontendMessage::NewTab { cwd } => self.create_tab(cwd.map(PathBuf::from), proxy),
+            FrontendMessage::SelectTab { tab_id } => self.select_tab(tab_id),
+            FrontendMessage::SelectPane { pane_id } => self.select_pane(pane_id),
+            FrontendMessage::CloseTab { tab_id } => self.close_tab(tab_id),
+            FrontendMessage::MinimizeWindow
+            | FrontendMessage::ToggleMaximizeWindow
+            | FrontendMessage::CloseWindow
+            | FrontendMessage::DragWindow
+            | FrontendMessage::ClosePane { .. } => Vec::new(),
+            FrontendMessage::FrontendError {
+                message,
+                source,
+                line,
+                column,
+                stack,
+            } => {
+                eprintln!(
+                    "frontend error: {message} at {}:{}:{}{}",
+                    source.unwrap_or_default(),
+                    line.unwrap_or_default(),
+                    column.unwrap_or_default(),
+                    stack
+                        .filter(|value| !value.trim().is_empty())
+                        .map(|value| format!("\n{value}"))
+                        .unwrap_or_default()
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    fn create_tab(
+        &mut self,
+        cwd: Option<PathBuf>,
+        proxy: EventLoopProxy<AppEvent>,
+    ) -> Vec<FrontendEvent> {
+        let tab_id = self.next_tab_id;
+        self.next_tab_id += 1;
+        let title = format!("Tab {}", self.tabs.len() + 1);
+
+        self.tabs.push(TabState {
+            id: tab_id,
+            panes: Vec::new(),
+            active_pane: 0,
+        });
+        self.active_tab = self.tabs.len() - 1;
+
+        let mut events = vec![
+            FrontendEvent::TabCreated { tab_id, title },
+            FrontendEvent::TabSelected { tab_id },
+        ];
+        events.extend(self.add_pane_to_active_tab(cwd, proxy));
+        events
+    }
+
+    fn add_pane(
+        &mut self,
+        cwd: Option<PathBuf>,
+        proxy: EventLoopProxy<AppEvent>,
+    ) -> Vec<FrontendEvent> {
+        if self.tabs.is_empty() {
+            return self.create_tab(cwd, proxy);
+        }
+
+        self.add_pane_to_active_tab(cwd, proxy)
+    }
+
+    fn add_pane_to_active_tab(
+        &mut self,
+        cwd: Option<PathBuf>,
+        _proxy: EventLoopProxy<AppEvent>,
+    ) -> Vec<FrontendEvent> {
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return Vec::new();
+        };
+
+        if tab.panes.len() >= MAX_PANES_PER_TAB {
+            return vec![FrontendEvent::Error {
+                message: format!("最多只能创建 {MAX_PANES_PER_TAB} 个 Pane"),
+            }];
+        }
+
+        let tab_id = tab.id;
+        let pane_id = self.next_pane_id;
+        self.next_pane_id += 1;
+        let effective_cwd = cwd
+            .clone()
+            .or_else(|| self.startup_directory.clone())
+            .or_else(|| env::current_dir().ok());
+        let cwd_display = display_cwd(&effective_cwd);
+
+        let tab = &mut self.tabs[self.active_tab];
+        tab.panes.push(PaneState {
+            id: pane_id,
+            cwd: effective_cwd,
+            terminal: None,
+            selection: String::new(),
+            exited: false,
+        });
+        tab.active_pane = tab.panes.len() - 1;
+
+        vec![
+            FrontendEvent::PaneCreated {
+                tab_id,
+                pane_id,
+                active: true,
+                exited: false,
+                cwd: Some(cwd_display),
+            },
+            FrontendEvent::PaneSelected { pane_id },
+        ]
+    }
+
+    fn replace_active_pane(
+        &mut self,
+        cwd: Option<PathBuf>,
+        proxy: EventLoopProxy<AppEvent>,
+    ) -> Vec<FrontendEvent> {
+        let Some((tab_index, pane_index, pane_id)) = self.active_pane_position() else {
+            return self.add_pane(cwd, proxy);
+        };
+
+        let effective_cwd = cwd
+            .clone()
+            .or_else(|| self.startup_directory.clone())
+            .or_else(|| env::current_dir().ok());
+        let cwd_display = display_cwd(&effective_cwd);
+
+        let pane = &mut self.tabs[tab_index].panes[pane_index];
+        pane.terminal.take();
+        pane.cwd = effective_cwd;
+        pane.selection.clear();
+        pane.exited = false;
+
+        vec![
+            FrontendEvent::PaneReset {
+                pane_id,
+                cwd: Some(cwd_display),
+            },
+            FrontendEvent::PaneSelected { pane_id },
+        ]
+    }
+
+    fn select_tab(&mut self, tab_id: u32) -> Vec<FrontendEvent> {
+        let Some(index) = self.tabs.iter().position(|tab| tab.id == tab_id) else {
+            return Vec::new();
+        };
+
+        self.active_tab = index;
+        let mut events = vec![FrontendEvent::TabSelected { tab_id }];
+        if let Some(pane_id) = self.tabs[index]
+            .panes
+            .get(self.tabs[index].active_pane)
+            .map(|pane| pane.id)
+        {
+            events.push(FrontendEvent::PaneSelected { pane_id });
+        }
+        events
+    }
+
+    fn select_pane(&mut self, pane_id: u32) -> Vec<FrontendEvent> {
+        for (tab_index, tab) in self.tabs.iter_mut().enumerate() {
+            if let Some(pane_index) = tab.panes.iter().position(|pane| pane.id == pane_id) {
+                self.active_tab = tab_index;
+                tab.active_pane = pane_index;
+                return vec![
+                    FrontendEvent::TabSelected { tab_id: tab.id },
+                    FrontendEvent::PaneSelected { pane_id },
+                ];
+            }
+        }
+        Vec::new()
+    }
+
+    fn update_settings(&mut self, font_family: String, font_size: u16) {
+        let font_family = normalize_font_family(font_family);
+        self.settings.font_family = font_family;
+        self.settings.font_size = normalize_font_size(font_size);
+        save_terminal_settings(&self.settings);
+    }
+
+    fn update_pane_selection(&mut self, pane_id: u32, text: String) {
+        if let Some(pane) = self.find_pane_mut(pane_id) {
+            pane.selection = text;
+        }
+    }
+
+    fn copy_active_selection(&self) -> Vec<FrontendEvent> {
+        let Some((tab_index, pane_index, _)) = self.active_pane_position() else {
+            return Vec::new();
+        };
+        let selection = self.tabs[tab_index].panes[pane_index].selection.clone();
+        if selection.is_empty() {
+            return vec![FrontendEvent::Status {
+                message: "没有选中内容".to_owned(),
+            }];
+        }
+
+        copy_to_clipboard(selection)
+    }
+
+    fn paste_from_clipboard(&mut self, pane_id: u32) -> Vec<FrontendEvent> {
+        let text = match Clipboard::new().and_then(|mut clipboard| clipboard.get_text()) {
+            Ok(text) if text.is_empty() => return Vec::new(),
+            Ok(text) => text,
+            Err(error) => {
+                return vec![FrontendEvent::Error {
+                    message: format!("failed to read clipboard: {error}"),
+                }];
+            }
+        };
+
+        if let Err(error) = self.write_to_pane(pane_id, text.as_bytes()) {
+            return vec![FrontendEvent::Error {
+                message: error.to_string(),
+            }];
+        }
+
+        Vec::new()
+    }
+
+    fn start_pane(
+        &mut self,
+        pane_id: u32,
+        cols: u16,
+        rows: u16,
+        proxy: EventLoopProxy<AppEvent>,
+    ) -> Vec<FrontendEvent> {
+        let cwd = match self.find_pane_mut(pane_id) {
+            Some(pane) if pane.terminal.is_some() => return Vec::new(),
+            Some(pane) => pane.cwd.clone(),
+            None => return Vec::new(),
+        };
+
+        match self.spawn_terminal(pane_id, cwd, cols, rows, proxy) {
+            Ok(session) => {
+                if let Some(pane) = self.find_pane_mut(pane_id) {
+                    pane.terminal = Some(session);
+                    pane.exited = false;
+                }
+                Vec::new()
+            }
+            Err(error) => {
+                if let Some(pane) = self.find_pane_mut(pane_id) {
+                    pane.exited = true;
+                }
+                vec![
+                    FrontendEvent::Error {
+                        message: format!("failed to start shell: {error:#}"),
+                    },
+                    FrontendEvent::Exit {
+                        pane_id,
+                        status: None,
+                    },
+                ]
+            }
+        }
+    }
+
+    fn write_to_pane(&mut self, pane_id: u32, bytes: &[u8]) -> Result<()> {
+        let pane = self
+            .find_pane_mut(pane_id)
+            .ok_or_else(|| anyhow!("unknown pane {pane_id}"))?;
+        let Some(terminal) = pane.terminal.as_mut() else {
+            return Ok(());
+        };
+
+        terminal
+            .writer
+            .write_all(bytes)
+            .context("failed to write to PTY")?;
+        terminal.writer.flush().ok();
+        Ok(())
+    }
+
+    fn resize_pane(&mut self, pane_id: u32, cols: u16, rows: u16) -> Result<()> {
+        let cols = cols.max(1);
+        let rows = rows.max(1);
+        let pane = self
+            .find_pane_mut(pane_id)
+            .ok_or_else(|| anyhow!("unknown pane {pane_id}"))?;
+        let Some(terminal) = pane.terminal.as_mut() else {
+            return Ok(());
+        };
+
+        if terminal.cols == cols && terminal.rows == rows {
+            return Ok(());
+        }
+
+        terminal.master.resize(pty_size(cols, rows))?;
+        terminal.cols = cols;
+        terminal.rows = rows;
+        Ok(())
+    }
+
+    fn handle_pty_exit(&mut self, pane_id: u32, status: Option<String>) -> Vec<FrontendEvent> {
+        if let Some(pane) = self.find_pane_mut(pane_id) {
+            pane.exited = true;
+            pane.terminal.take();
+        }
+
+        vec![FrontendEvent::Exit { pane_id, status }]
+    }
+
+    fn spawn_terminal(
+        &self,
+        pane_id: u32,
+        cwd: Option<PathBuf>,
+        cols: u16,
+        rows: u16,
+        proxy: EventLoopProxy<AppEvent>,
+    ) -> Result<TerminalSession> {
+        let shell = self
+            .shell_profiles
+            .get(self.active_shell)
+            .cloned()
+            .ok_or_else(|| anyhow!("no shell profile available"))?;
+
+        spawn_terminal_session(pane_id, shell, cwd, cols, rows, proxy)
+    }
+
+    fn active_pane_position(&self) -> Option<(usize, usize, u32)> {
+        let tab = self.tabs.get(self.active_tab)?;
+        let pane = tab.panes.get(tab.active_pane)?;
+        Some((self.active_tab, tab.active_pane, pane.id))
+    }
+
+    fn find_pane_mut(&mut self, pane_id: u32) -> Option<&mut PaneState> {
+        self.tabs
+            .iter_mut()
+            .flat_map(|tab| tab.panes.iter_mut())
+            .find(|pane| pane.id == pane_id)
+    }
+
+    fn close_pane(&mut self, pane_id: u32) -> Vec<FrontendEvent> {
+        let mut closed_events = vec![FrontendEvent::PaneClosed { pane_id }];
+        let mut close_tab_id = None;
+        for (tab_index, tab) in self.tabs.iter_mut().enumerate() {
+            if let Some(pane_index) = tab.panes.iter().position(|pane| pane.id == pane_id) {
+                tab.panes.remove(pane_index);
+                if tab.panes.is_empty() {
+                    close_tab_id = Some(tab.id);
+                    break;
+                }
+                if tab.active_pane >= tab.panes.len() {
+                    tab.active_pane = tab.panes.len() - 1;
+                }
+                if self.active_tab == tab_index {
+                    let new_active_id = tab.panes[tab.active_pane].id;
+                    closed_events.push(FrontendEvent::PaneSelected {
+                        pane_id: new_active_id,
+                    });
+                }
+                break;
+            }
+        }
+        if let Some(tab_id) = close_tab_id {
+            closed_events.extend(self.close_tab(tab_id));
+        }
+        closed_events
+    }
+
+    fn close_tab(&mut self, tab_id: u32) -> Vec<FrontendEvent> {
+        let Some(index) = self.tabs.iter().position(|tab| tab.id == tab_id) else {
+            return Vec::new();
+        };
+
+        let was_active = self.active_tab == index;
+        self.tabs.remove(index);
+        let mut events = vec![FrontendEvent::TabClosed { tab_id }];
+
+        if self.tabs.is_empty() {
+            self.active_tab = 0;
+            return events;
+        }
+
+        if index < self.active_tab {
+            self.active_tab -= 1;
+        } else if self.active_tab >= self.tabs.len() {
+            self.active_tab = self.tabs.len() - 1;
+        }
+
+        if was_active {
+            let tab = &self.tabs[self.active_tab];
+            let tab_id = tab.id;
+            events.push(FrontendEvent::TabSelected { tab_id });
+            if let Some(pane_id) = tab.panes.get(tab.active_pane).map(|pane| pane.id) {
+                events.push(FrontendEvent::PaneSelected { pane_id });
+            }
+        }
+
+        events
+    }
+
+    fn shutdown(&mut self) {
+        for pane in self.tabs.iter_mut().flat_map(|tab| tab.panes.iter_mut()) {
+            pane.terminal.take();
+        }
+    }
+}
+
+fn emit_or_queue_frontend_events(
+    webview: &WebView,
+    frontend_ready: bool,
+    pending_frontend_events: &mut Vec<FrontendEvent>,
+    events: Vec<FrontendEvent>,
+) {
+    if frontend_ready {
+        for event in events {
+            emit_frontend_event(webview, &event);
+        }
+    } else {
+        pending_frontend_events.extend(events);
+    }
+}
+
+fn emit_frontend_event(webview: &WebView, event: &FrontendEvent) {
+    let Ok(json) = serde_json::to_string(event) else {
+        return;
+    };
+    let script = format!("window.vibeTerm && window.vibeTerm.receive({json});");
+    if let Err(error) = webview.evaluate_script(&script) {
+        eprintln!("failed to evaluate frontend script: {error}");
+    }
+}
+
+fn spawn_terminal_session(
+    pane_id: u32,
+    shell: ShellProfile,
+    cwd: Option<PathBuf>,
+    cols: u16,
+    rows: u16,
+    proxy: EventLoopProxy<AppEvent>,
+) -> Result<TerminalSession> {
+    let cols = cols.max(1);
+    let rows = rows.max(1);
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(pty_size(cols, rows))
+        .context("failed to open PTY")?;
+
+    let mut command = CommandBuilder::new(shell.program);
+    command.args(shell.args);
+    command.env("TERM", "xterm-256color");
+    command.env("COLORTERM", "truecolor");
+    command.env("TERM_PROGRAM", "VibeTerm");
+    command.env("VIBETERM", "1");
+    if let Some(cwd) = cwd {
+        command.cwd(cwd.as_os_str());
+    }
+
+    let mut child = pair
+        .slave
+        .spawn_command(command)
+        .context("failed to spawn shell")?;
+    let killer = child.clone_killer();
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .context("failed to clone PTY reader")?;
+    let writer = pair
+        .master
+        .take_writer()
+        .context("failed to take PTY writer")?;
+    drop(pair.slave);
+
+    let output_proxy = proxy.clone();
+    thread::spawn(move || {
+        let mut buffer = [0u8; 8192];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(size) => {
+                    let _ = output_proxy.send_event(AppEvent::PtyOutput {
+                        pane_id,
+                        data_base64: STANDARD.encode(&buffer[..size]),
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+    });
+
+    thread::spawn(move || {
+        let status = child.wait().ok().map(|status| status.to_string());
+        let _ = proxy.send_event(AppEvent::PtyExit { pane_id, status });
+    });
+
+    Ok(TerminalSession {
+        master: pair.master,
+        writer,
+        killer,
+        cols,
+        rows,
+    })
+}
+
+fn pty_size(cols: u16, rows: u16) -> PtySize {
+    PtySize {
+        cols: cols.max(1),
+        rows: rows.max(1),
+        pixel_width: 0,
+        pixel_height: 0,
+    }
+}
+
+fn display_cwd(cwd: &Option<PathBuf>) -> String {
+    cwd.as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "~".to_owned())
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+    html_url: String,
+    body: Option<String>,
+    #[serde(default)]
+    assets: Vec<GithubReleaseAsset>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubReleaseAsset {
+    name: String,
+    browser_download_url: String,
+}
+
+fn default_terminal_font() -> String {
+    DEFAULT_TERMINAL_FONT.to_owned()
+}
+
+fn default_terminal_font_size() -> u16 {
+    DEFAULT_TERMINAL_FONT_SIZE
+}
+
+fn normalize_font_family(font_family: String) -> String {
+    let font_family = font_family.trim();
+    if font_family.is_empty() {
+        DEFAULT_TERMINAL_FONT.to_owned()
+    } else {
+        font_family.to_owned()
+    }
+}
+
+fn normalize_font_size(font_size: u16) -> u16 {
+    font_size.clamp(MIN_TERMINAL_FONT_SIZE, MAX_TERMINAL_FONT_SIZE)
+}
+
+fn normalized_release_version(version: &str) -> String {
+    version
+        .trim()
+        .trim_start_matches(['v', 'V'])
+        .split_once('+')
+        .map(|(version, _)| version)
+        .unwrap_or_else(|| version.trim().trim_start_matches(['v', 'V']))
+        .to_owned()
+}
+
+fn version_components(version: &str) -> Vec<u64> {
+    normalized_release_version(version)
+        .split(['.', '-'])
+        .map(|part| {
+            part.chars()
+                .take_while(|ch| ch.is_ascii_digit())
+                .collect::<String>()
+                .parse::<u64>()
+                .unwrap_or(0)
+        })
+        .collect()
+}
+
+fn is_newer_version(latest: &str, current: &str) -> bool {
+    let latest = version_components(latest);
+    let current = version_components(current);
+    let len = latest.len().max(current.len()).max(3);
+    for index in 0..len {
+        let left = latest.get(index).copied().unwrap_or(0);
+        let right = current.get(index).copied().unwrap_or(0);
+        if left != right {
+            return left > right;
+        }
+    }
+    false
+}
+
+fn preferred_update_asset(release: &GithubRelease) -> Option<&GithubReleaseAsset> {
+    release
+        .assets
+        .iter()
+        .filter(|asset| asset.name.to_ascii_lowercase().ends_with(".exe"))
+        .max_by_key(|asset| {
+            let name = asset.name.to_ascii_lowercase();
+            let setup_score = usize::from(name.contains("setup")) * 8;
+            let windows_score = usize::from(name.contains("windows") || name.contains("win")) * 4;
+            let arch_score = usize::from(name.contains("x64") || name.contains("amd64")) * 2;
+            setup_score + windows_score + arch_score
+        })
+}
+
+fn response_body_message(body: &str) -> Option<String> {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
+        if let Some(message) = value.get("message").and_then(|value| value.as_str()) {
+            return Some(message.trim().to_owned());
+        }
+    }
+
+    body.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| line.chars().take(180).collect::<String>())
+}
+
+fn describe_ureq_error(error: ureq::Error) -> anyhow::Error {
+    match error {
+        ureq::Error::Status(status, response) => {
+            let status_text = response.status_text().to_owned();
+            let body = response.into_string().unwrap_or_default();
+            let message = response_body_message(&body)
+                .map(|message| format!(": {message}"))
+                .unwrap_or_default();
+            anyhow!("HTTP {status} {status_text}{message}")
+        }
+        ureq::Error::Transport(error) => anyhow!("网络请求失败: {error}"),
+    }
+}
+
+fn github_get(url: &str) -> Result<ureq::Response> {
+    ureq::get(url)
+        .set("User-Agent", UPDATE_USER_AGENT)
+        .set("Accept", "application/vnd.github+json, text/html;q=0.9")
+        .call()
+        .map_err(describe_ureq_error)
+}
+
+fn check_for_updates(proxy: EventLoopProxy<AppEvent>, manual: bool) {
+    thread::spawn(move || {
+        let events = match fetch_latest_release() {
+            Ok(release) => {
+                let current_version = env!("CARGO_PKG_VERSION").to_owned();
+                let latest_version = normalized_release_version(&release.tag_name);
+                if is_newer_version(&latest_version, &current_version) {
+                    let asset = preferred_update_asset(&release);
+                    let asset_url = asset.map(|asset| asset.browser_download_url.clone());
+                    let asset_name = asset.map(|asset| asset.name.clone());
+                    vec![FrontendEvent::UpdateAvailable {
+                        current_version,
+                        version: latest_version,
+                        html_url: release.html_url,
+                        asset_url,
+                        asset_name,
+                        body: release.body.filter(|body| !body.trim().is_empty()),
+                    }]
+                } else {
+                    vec![FrontendEvent::UpdateNotAvailable {
+                        current_version,
+                        latest_version,
+                    }]
+                }
+            }
+            Err(error) => {
+                let prefix = if manual {
+                    "检查更新失败"
+                } else {
+                    "自动检查更新失败"
+                };
+                vec![FrontendEvent::UpdateError {
+                    message: format!("{prefix}: {error}"),
+                }]
+            }
+        };
+        let _ = proxy.send_event(AppEvent::FrontendEvents(events));
+    });
+}
+
+fn fetch_latest_release() -> Result<GithubRelease> {
+    match fetch_latest_release_from_api() {
+        Ok(release) => Ok(release),
+        Err(api_error) => fetch_latest_release_from_page()
+            .with_context(|| format!("GitHub API 请求失败，页面兜底也失败。API 错误: {api_error}")),
+    }
+}
+
+fn fetch_latest_release_from_api() -> Result<GithubRelease> {
+    let response =
+        github_get(GITHUB_LATEST_RELEASE_API).context("请求 GitHub 最新版本 API 失败")?;
+    response
+        .into_json::<GithubRelease>()
+        .context("解析 GitHub 最新版本 API 失败")
+}
+
+fn fetch_latest_release_from_page() -> Result<GithubRelease> {
+    let response =
+        github_get(GITHUB_LATEST_RELEASE_PAGE).context("请求 GitHub 最新版本页面失败")?;
+    let final_url = response.get_url().to_owned();
+    let tag_name = release_tag_from_url(&final_url)
+        .with_context(|| format!("无法从 GitHub 跳转地址识别版本号: {final_url}"))?;
+    let html_url = format!("https://github.com/{GITHUB_REPOSITORY}/releases/tag/{tag_name}");
+    let assets = fetch_release_assets_from_page(&tag_name).unwrap_or_default();
+
+    Ok(GithubRelease {
+        tag_name,
+        html_url,
+        body: None,
+        assets,
+    })
+}
+
+fn release_tag_from_url(url: &str) -> Option<String> {
+    let marker = "/releases/tag/";
+    let (_, tag) = url.split_once(marker)?;
+    let tag = tag.split(['?', '#', '/']).next()?.trim();
+    (!tag.is_empty()).then(|| tag.to_owned())
+}
+
+fn fetch_release_assets_from_page(tag_name: &str) -> Result<Vec<GithubReleaseAsset>> {
+    let url = format!("https://github.com/{GITHUB_REPOSITORY}/releases/expanded_assets/{tag_name}");
+    let html = github_get(&url)
+        .context("请求 GitHub release 资产列表失败")?
+        .into_string()
+        .context("读取 GitHub release 资产列表失败")?;
+    Ok(extract_release_assets(&html, tag_name))
+}
+
+fn extract_release_assets(html: &str, tag_name: &str) -> Vec<GithubReleaseAsset> {
+    let prefix = format!("/{GITHUB_REPOSITORY}/releases/download/{tag_name}/");
+    let mut assets = Vec::new();
+
+    for href in extract_href_values(html) {
+        if !href.starts_with(&prefix) || !href.to_ascii_lowercase().ends_with(".exe") {
+            continue;
+        }
+        let Some(asset_url) = github_url_from_href(&href) else {
+            continue;
+        };
+        let name = href
+            .rsplit('/')
+            .next()
+            .map(percent_decode)
+            .unwrap_or_else(|| asset_url.clone());
+        if !assets
+            .iter()
+            .any(|asset: &GithubReleaseAsset| asset.browser_download_url == asset_url)
+        {
+            assets.push(GithubReleaseAsset {
+                name,
+                browser_download_url: asset_url,
+            });
+        }
+    }
+
+    assets
+}
+
+fn extract_href_values(html: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut rest = html;
+
+    while let Some(index) = rest.find("href=") {
+        rest = &rest[index + "href=".len()..];
+        let Some(quote) = rest.chars().next() else {
+            break;
+        };
+        if quote != '"' && quote != '\'' {
+            continue;
+        }
+        rest = &rest[quote.len_utf8()..];
+        let Some(end) = rest.find(quote) else {
+            break;
+        };
+        values.push(html_unescape_attribute(&rest[..end]));
+        rest = &rest[end + quote.len_utf8()..];
+    }
+
+    values
+}
+
+fn github_url_from_href(href: &str) -> Option<String> {
+    if href.starts_with("https://github.com/") {
+        Some(href.to_owned())
+    } else if href.starts_with('/') {
+        Some(format!("https://github.com{href}"))
+    } else {
+        None
+    }
+}
+
+fn html_unescape_attribute(value: &str) -> String {
+    value
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+}
+
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let high = (bytes[index + 1] as char).to_digit(16);
+            let low = (bytes[index + 2] as char).to_digit(16);
+            if let (Some(high), Some(low)) = (high, low) {
+                output.push(((high << 4) | low) as u8);
+                index += 3;
+                continue;
+            }
+        }
+        output.push(bytes[index]);
+        index += 1;
+    }
+
+    String::from_utf8_lossy(&output).into_owned()
+}
+
+fn install_update(
+    proxy: EventLoopProxy<AppEvent>,
+    version: String,
+    asset_url: String,
+    silent: bool,
+) {
+    thread::spawn(move || {
+        let events = match download_and_launch_update(&version, &asset_url, silent) {
+            Ok(()) => vec![FrontendEvent::UpdateInstallLaunched { version }],
+            Err(error) => vec![FrontendEvent::UpdateError {
+                message: format!("更新安装启动失败: {error}"),
+            }],
+        };
+        let _ = proxy.send_event(AppEvent::FrontendEvents(events));
+    });
+}
+
+fn download_and_launch_update(version: &str, asset_url: &str, silent: bool) -> Result<()> {
+    let directory = env::temp_dir().join("VibeTerm").join("updates");
+    fs::create_dir_all(&directory).context("failed to create update cache directory")?;
+    let installer_path = directory.join(format!(
+        "vibeterm-setup-{}-windows-x64.exe",
+        sanitize_filename(version)
+    ));
+
+    let response = ureq::get(asset_url)
+        .set("User-Agent", UPDATE_USER_AGENT)
+        .call()
+        .context("failed to download update")?;
+    let mut reader = response.into_reader();
+    let mut file = fs::File::create(&installer_path).context("failed to create update file")?;
+    io::copy(&mut reader, &mut file).context("failed to write update file")?;
+    file.flush().ok();
+
+    let mut command = Command::new(&installer_path);
+    if silent {
+        command.args([
+            "/SILENT",
+            "/SUPPRESSMSGBOXES",
+            "/NORESTART",
+            "/CLOSEAPPLICATIONS",
+            "/RESTARTAPPLICATIONS",
+        ]);
+    }
+    command
+        .spawn()
+        .with_context(|| format!("failed to launch {}", installer_path.display()))?;
+    Ok(())
+}
+
+fn sanitize_filename(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "latest".to_owned()
+    } else {
+        sanitized
+    }
+}
+
+fn copy_to_clipboard(text: String) -> Vec<FrontendEvent> {
+    if text.is_empty() {
+        return vec![FrontendEvent::Status {
+            message: "没有选中内容".to_owned(),
+        }];
+    }
+
+    match Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text)) {
+        Ok(()) => vec![FrontendEvent::Status {
+            message: "已复制".to_owned(),
+        }],
+        Err(error) => vec![FrontendEvent::Error {
+            message: format!("failed to write clipboard: {error}"),
+        }],
+    }
+}
+
+fn system_font_families() -> Vec<String> {
+    let mut database = fontdb::Database::new();
+    database.load_system_fonts();
+
+    let mut families = BTreeSet::new();
+    for face in database.faces() {
+        for (family, _) in &face.families {
+            let family = family.trim();
+            if !family.is_empty() {
+                families.insert(family.to_owned());
+            }
+        }
+    }
+
+    families.into_iter().collect()
+}
+
+fn load_terminal_settings() -> TerminalSettings {
+    let Some(path) = settings_path() else {
+        return TerminalSettings::default();
+    };
+    let Ok(contents) = fs::read_to_string(path) else {
+        return TerminalSettings::default();
+    };
+    let Ok(mut settings) = serde_json::from_str::<TerminalSettings>(&contents) else {
+        return TerminalSettings::default();
+    };
+    settings.font_family = normalize_font_family(settings.font_family);
+    settings.font_size = normalize_font_size(settings.font_size);
+    settings
+}
+
+fn save_terminal_settings(settings: &TerminalSettings) {
+    let Some(path) = settings_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).ok();
+    }
+    if let Ok(contents) = serde_json::to_string_pretty(settings) {
+        fs::write(path, contents).ok();
+    }
+}
+
+fn settings_path() -> Option<PathBuf> {
+    if cfg!(windows) {
+        env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .map(|path| path.join("VibeTerm").join("settings.json"))
+    } else {
+        env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|path| path.join(".config").join("vibeterm").join("settings.json"))
+    }
 }
 
 fn parse_cli_args() -> CliArgs {
@@ -65,7 +1629,6 @@ fn parse_cli_args() -> CliArgs {
                 }
             }
             _ => {
-                // Legacy: first positional argument is treated as cwd
                 if cwd.is_none() && !args[i].starts_with('-') {
                     cwd = Some(PathBuf::from(&args[i]));
                 }
@@ -77,1549 +1640,19 @@ fn parse_cli_args() -> CliArgs {
     CliArgs { cwd, action }
 }
 
-#[allow(dead_code)]
-const MAX_PANES: usize = 6;
-const APP_ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
-
-// ============ One Dark Pro Theme ============
-
-fn one_dark_pro_visuals() -> egui::Visuals {
-    let mut v = egui::Visuals::dark();
-    v.override_text_color = Some(egui::Color32::from_rgb(171, 178, 191));
-    v.panel_fill = egui::Color32::from_rgb(33, 37, 43);
-    v.window_fill = egui::Color32::from_rgb(40, 44, 52);
-    v.extreme_bg_color = egui::Color32::from_rgb(30, 33, 39);
-    v.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(40, 44, 52);
-    v.widgets.inactive.bg_fill = egui::Color32::from_rgb(45, 50, 59);
-    v.widgets.hovered.bg_fill = egui::Color32::from_rgb(50, 56, 66);
-    v.widgets.active.bg_fill = egui::Color32::from_rgb(57, 63, 74);
-    v.hyperlink_color = egui::Color32::from_rgb(198, 120, 221);
-    v.selection.bg_fill = egui::Color32::from_rgb(198, 120, 221).linear_multiply(0.35);
-    v.selection.stroke.color = egui::Color32::from_rgb(198, 120, 221);
-    v
-}
-
-fn one_dark_pro_pane_border_style() -> PaneBorderStyle {
-    PaneBorderStyle {
-        active_border: egui::Color32::from_rgb(198, 120, 221),
-        inactive_border: egui::Color32::from_rgb(76, 84, 99),
-        active_title_fill: egui::Color32::from_rgb(62, 46, 72),
-        inactive_title_fill: egui::Color32::from_rgb(33, 37, 43),
-        active_badge_fill: egui::Color32::from_rgb(198, 120, 221),
-        inactive_badge_fill: egui::Color32::from_rgb(92, 99, 112),
-        body_fill: egui::Color32::from_rgb(40, 44, 52),
-        title_text: egui::Color32::from_rgb(220, 223, 228),
-        badge_text: egui::Color32::from_rgb(30, 33, 39),
-    }
-}
-
-#[derive(Clone, Copy)]
-struct PaneBorderStyle {
-    active_border: egui::Color32,
-    inactive_border: egui::Color32,
-    active_title_fill: egui::Color32,
-    inactive_title_fill: egui::Color32,
-    active_badge_fill: egui::Color32,
-    inactive_badge_fill: egui::Color32,
-    body_fill: egui::Color32,
-    title_text: egui::Color32,
-    badge_text: egui::Color32,
-}
-
-// ============ Terminal Themes ============
-
-fn one_dark_pro_palette() -> ColorPalette {
-    ColorPalette {
-        foreground: "#abb2bf".to_string(),
-        background: "#282c34".to_string(),
-        black: "#282c34".to_string(),
-        red: "#e06c75".to_string(),
-        green: "#98c379".to_string(),
-        yellow: "#e5c07b".to_string(),
-        blue: "#61afef".to_string(),
-        magenta: "#c678dd".to_string(),
-        cyan: "#56b6c2".to_string(),
-        white: "#abb2bf".to_string(),
-        bright_black: "#5c6370".to_string(),
-        bright_red: "#e06c75".to_string(),
-        bright_green: "#98c379".to_string(),
-        bright_yellow: "#e5c07b".to_string(),
-        bright_blue: "#61afef".to_string(),
-        bright_magenta: "#c678dd".to_string(),
-        bright_cyan: "#56b6c2".to_string(),
-        bright_white: "#ffffff".to_string(),
-        bright_foreground: None,
-        dim_foreground: "#5c6370".to_string(),
-        dim_black: "#21252b".to_string(),
-        dim_red: "#e06c75".to_string(),
-        dim_green: "#98c379".to_string(),
-        dim_yellow: "#e5c07b".to_string(),
-        dim_blue: "#61afef".to_string(),
-        dim_magenta: "#c678dd".to_string(),
-        dim_cyan: "#56b6c2".to_string(),
-        dim_white: "#abb2bf".to_string(),
-    }
-}
-
-fn dracula_palette() -> ColorPalette {
-    ColorPalette {
-        foreground: "#f8f8f2".to_string(),
-        background: "#282a36".to_string(),
-        black: "#282a36".to_string(),
-        red: "#ff5555".to_string(),
-        green: "#50fa7b".to_string(),
-        yellow: "#f1fa8c".to_string(),
-        blue: "#bd93f9".to_string(),
-        magenta: "#ff79c6".to_string(),
-        cyan: "#8be9fd".to_string(),
-        white: "#f8f8f2".to_string(),
-        bright_black: "#6272a4".to_string(),
-        bright_red: "#ff6e6e".to_string(),
-        bright_green: "#69ff94".to_string(),
-        bright_yellow: "#ffffa5".to_string(),
-        bright_blue: "#d6acff".to_string(),
-        bright_magenta: "#ff92df".to_string(),
-        bright_cyan: "#a4ffff".to_string(),
-        bright_white: "#ffffff".to_string(),
-        bright_foreground: None,
-        dim_foreground: "#6272a4".to_string(),
-        dim_black: "#21222c".to_string(),
-        dim_red: "#ff5555".to_string(),
-        dim_green: "#50fa7b".to_string(),
-        dim_yellow: "#f1fa8c".to_string(),
-        dim_blue: "#bd93f9".to_string(),
-        dim_magenta: "#ff79c6".to_string(),
-        dim_cyan: "#8be9fd".to_string(),
-        dim_white: "#f8f8f2".to_string(),
-    }
-}
-
-fn solarized_dark_palette() -> ColorPalette {
-    ColorPalette {
-        foreground: "#839496".to_string(),
-        background: "#002b36".to_string(),
-        black: "#073642".to_string(),
-        red: "#dc322f".to_string(),
-        green: "#859900".to_string(),
-        yellow: "#b58900".to_string(),
-        blue: "#268bd2".to_string(),
-        magenta: "#d33682".to_string(),
-        cyan: "#2aa198".to_string(),
-        white: "#eee8d5".to_string(),
-        bright_black: "#586e75".to_string(),
-        bright_red: "#cb4b16".to_string(),
-        bright_green: "#586e75".to_string(),
-        bright_yellow: "#657b83".to_string(),
-        bright_blue: "#839496".to_string(),
-        bright_magenta: "#6c71c4".to_string(),
-        bright_cyan: "#93a1a1".to_string(),
-        bright_white: "#fdf6e3".to_string(),
-        bright_foreground: None,
-        dim_foreground: "#586e75".to_string(),
-        dim_black: "#002b36".to_string(),
-        dim_red: "#dc322f".to_string(),
-        dim_green: "#859900".to_string(),
-        dim_yellow: "#b58900".to_string(),
-        dim_blue: "#268bd2".to_string(),
-        dim_magenta: "#d33682".to_string(),
-        dim_cyan: "#2aa198".to_string(),
-        dim_white: "#eee8d5".to_string(),
-    }
-}
-
-fn gruvbox_dark_palette() -> ColorPalette {
-    ColorPalette {
-        foreground: "#d4be93".to_string(),
-        background: "#282828".to_string(),
-        black: "#282828".to_string(),
-        red: "#ea6962".to_string(),
-        green: "#a9b16e".to_string(),
-        yellow: "#e3a84b".to_string(),
-        blue: "#7a9dcf".to_string(),
-        magenta: "#d3869b".to_string(),
-        cyan: "#89b4fa".to_string(),
-        white: "#d4be93".to_string(),
-        bright_black: "#665c54".to_string(),
-        bright_red: "#ea6962".to_string(),
-        bright_green: "#a9b16e".to_string(),
-        bright_yellow: "#e3a84b".to_string(),
-        bright_blue: "#7a9dcf".to_string(),
-        bright_magenta: "#d3869b".to_string(),
-        bright_cyan: "#89b4fa".to_string(),
-        bright_white: "#f5e8bc".to_string(),
-        bright_foreground: None,
-        dim_foreground: "#665c54".to_string(),
-        dim_black: "#1d2021".to_string(),
-        dim_red: "#ea6962".to_string(),
-        dim_green: "#a9b16e".to_string(),
-        dim_yellow: "#e3a84b".to_string(),
-        dim_blue: "#7a9dcf".to_string(),
-        dim_magenta: "#d3869b".to_string(),
-        dim_cyan: "#89b4fa".to_string(),
-        dim_white: "#d4be93".to_string(),
-    }
-}
-
-fn monokai_palette() -> ColorPalette {
-    ColorPalette {
-        foreground: "#f8f8f2".to_string(),
-        background: "#272822".to_string(),
-        black: "#272822".to_string(),
-        red: "#f92672".to_string(),
-        green: "#a6e22e".to_string(),
-        yellow: "#f4bf75".to_string(),
-        blue: "#66d9ef".to_string(),
-        magenta: "#ae81ff".to_string(),
-        cyan: "#a1efe4".to_string(),
-        white: "#f8f8f2".to_string(),
-        bright_black: "#75715e".to_string(),
-        bright_red: "#f92672".to_string(),
-        bright_green: "#a6e22e".to_string(),
-        bright_yellow: "#f4bf75".to_string(),
-        bright_blue: "#66d9ef".to_string(),
-        bright_magenta: "#ae81ff".to_string(),
-        bright_cyan: "#a1efe4".to_string(),
-        bright_white: "#f9f8f5".to_string(),
-        bright_foreground: None,
-        dim_foreground: "#75715e".to_string(),
-        dim_black: "#1e1f1c".to_string(),
-        dim_red: "#f92672".to_string(),
-        dim_green: "#a6e22e".to_string(),
-        dim_yellow: "#f4bf75".to_string(),
-        dim_blue: "#66d9ef".to_string(),
-        dim_magenta: "#ae81ff".to_string(),
-        dim_cyan: "#a1efe4".to_string(),
-        dim_white: "#f8f8f2".to_string(),
-    }
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum TerminalThemeType {
-    OneDarkPro,
-    Dracula,
-    SolarizedDark,
-    GruvboxDark,
-    Monokai,
-}
-
-impl TerminalThemeType {
-    fn palette(&self) -> ColorPalette {
-        match self {
-            TerminalThemeType::OneDarkPro => one_dark_pro_palette(),
-            TerminalThemeType::Dracula => dracula_palette(),
-            TerminalThemeType::SolarizedDark => solarized_dark_palette(),
-            TerminalThemeType::GruvboxDark => gruvbox_dark_palette(),
-            TerminalThemeType::Monokai => monokai_palette(),
-        }
-    }
-
-    fn name(&self) -> &'static str {
-        match self {
-            TerminalThemeType::OneDarkPro => "One Dark Pro",
-            TerminalThemeType::Dracula => "Dracula",
-            TerminalThemeType::SolarizedDark => "Solarized Dark",
-            TerminalThemeType::GruvboxDark => "Gruvbox Dark",
-            TerminalThemeType::Monokai => "Monokai",
-        }
-    }
-
-    fn all() -> [TerminalThemeType; 5] {
-        [
-            TerminalThemeType::OneDarkPro,
-            TerminalThemeType::Dracula,
-            TerminalThemeType::SolarizedDark,
-            TerminalThemeType::GruvboxDark,
-            TerminalThemeType::Monokai,
-        ]
-    }
-}
-
-// ============ Font System ============
-
-#[derive(Clone, Debug)]
-struct FontInfo {
-    name: String,
-    path: Option<String>,
-}
-
-fn available_fonts() -> Vec<FontInfo> {
-    let mut fonts = Vec::new();
-    
-    // Windows fonts directory
-    let windows_fonts = Path::new("C:\\Windows\\Fonts");
-    
-    let font_candidates = [
-        ("Consolas", "consola.ttf"),
-        ("Cascadia Mono", "CascadiaMono.ttf"),
-        ("Cascadia Code", "CascadiaCode.ttf"),
-        ("CaskaydiaCove Nerd Font", "CaskaydiaCoveNerdFont-Regular.ttf"),
-        ("JetBrainsMono Nerd Font", "JetBrainsMonoNerdFont-Regular.ttf"),
-    ];
-    
-    for (name, file) in font_candidates {
-        let path = windows_fonts.join(file);
-        if path.exists() {
-            fonts.push(FontInfo {
-                name: name.to_string(),
-                path: Some(path.to_string_lossy().to_string()),
-            });
-        }
-    }
-    
-    // Always add monospace as fallback
-    fonts.push(FontInfo {
-        name: "Monospace".to_string(),
-        path: None,
-    });
-    
-    fonts
-}
-
-// ============ Pane ============
-
-struct Pane {
-    title: String,
-    backend: TerminalBackend,
-    receiver: Receiver<(u64, PtyEvent)>,
-    exited: bool,
-    last_terminal_size: Option<egui::Vec2>,
-}
-
-// ============ Shell Profile ============
-
-#[derive(Clone)]
-struct ShellProfile {
-    name: String,
-    program: String,
-    args: Vec<String>,
-}
-
-// ============ Update Check ============
-
-const VERSION: &str = env!("CARGO_PKG_VERSION");
-const GITHUB_RELEASE_API: &str = "https://api.github.com/repos/DarlingCY/VibeTerm/releases/latest";
-
-#[derive(Debug, Clone)]
-struct GitHubRelease {
-    tag_name: String,
-    html_url: String,
-    assets: Vec<ReleaseAsset>,
-}
-
-#[derive(Debug, Clone)]
-struct ReleaseAsset {
-    name: String,
-    browser_download_url: String,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum UpdateStatus {
-    Idle,
-    Checking,
-    UpToDate(String),
-    UpdateAvailable { version: String, url: String, installer_url: Option<String> },
-    Downloading { version: String, progress: f32 },
-    LaunchingInstaller,
-    Error(String),
-}
-
-struct UpdateChecker {
-    status: UpdateStatus,
-    check_receiver: Option<Receiver<Result<GitHubRelease, String>>>,
-    download_receiver: Option<Receiver<Result<PathBuf, String>>>,
-}
-
-impl Default for UpdateChecker {
-    fn default() -> Self {
-        Self {
-            status: UpdateStatus::Idle,
-            check_receiver: None,
-            download_receiver: None,
-        }
-    }
-}
-
-impl UpdateChecker {
-    fn check_for_updates(&mut self) {
-        if self.status == UpdateStatus::Checking {
-            return;
-        }
-        self.status = UpdateStatus::Checking;
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.check_receiver = Some(rx);
-
-        thread::spawn(move || {
-            let result = fetch_latest_release();
-            let _ = tx.send(result);
-        });
-    }
-
-    fn start_download(&mut self, version: String, url: String) {
-        if matches!(self.status, UpdateStatus::Downloading { .. }) {
-            return;
-        }
-        self.status = UpdateStatus::Downloading { version, progress: 0.0 };
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.download_receiver = Some(rx);
-
-        thread::spawn(move || {
-            let result = download_installer(&url);
-            let _ = tx.send(result);
-        });
-    }
-
-    fn poll(&mut self) {
-        // Poll check result
-        if let Some(ref rx) = self.check_receiver {
-            if let Ok(result) = rx.try_recv() {
-                self.check_receiver = None;
-                match result {
-                    Ok(release) => {
-                        let current = parse_version(VERSION);
-                        let latest = parse_version(&release.tag_name);
-                        if let (Some(current), Some(latest)) = (current, latest) {
-                            if latest > current {
-                                let installer_url = find_windows_installer(&release.assets);
-                                self.status = UpdateStatus::UpdateAvailable {
-                                    version: release.tag_name,
-                                    url: release.html_url,
-                                    installer_url,
-                                };
-                            } else {
-                                self.status = UpdateStatus::UpToDate(format!("v{}", VERSION));
-                            }
-                        } else {
-                            self.status = UpdateStatus::Error("版本号格式无效".to_string());
-                        }
-                    }
-                    Err(e) => {
-                        self.status = UpdateStatus::Error(e);
-                    }
-                }
-            }
-        }
-
-        // Poll download result
-        if let Some(ref rx) = self.download_receiver {
-            if let Ok(result) = rx.try_recv() {
-                self.download_receiver = None;
-                match result {
-                    Ok(path) => {
-                        self.status = UpdateStatus::LaunchingInstaller;
-                        thread::spawn(move || {
-                            let _ = std::process::Command::new(&path).spawn();
-                        });
-                    }
-                    Err(e) => {
-                        self.status = UpdateStatus::Error(e);
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn parse_version(s: &str) -> Option<Version> {
-    let s = s.trim_start_matches('v');
-    Version::parse(s).ok()
-}
-
-fn find_windows_installer(assets: &[ReleaseAsset]) -> Option<String> {
-    // Priority: .exe installer (setup, install, etc.)
-    for asset in assets {
-        let name_lower = asset.name.to_lowercase();
-        if name_lower.ends_with(".exe") 
-            && (name_lower.contains("setup") 
-                || name_lower.contains("install")
-                || name_lower.contains("vibeterm")) {
-            return Some(asset.browser_download_url.clone());
-        }
-    }
-    // Fallback: any .exe file
-    for asset in assets {
-        if asset.name.to_lowercase().ends_with(".exe") {
-            return Some(asset.browser_download_url.clone());
-        }
-    }
-    None
-}
-
-fn download_installer(url: &str) -> Result<PathBuf, String> {
-    let temp_dir = std::env::temp_dir();
-    let filename = url.split('/').last().unwrap_or("installer.exe");
-    let dest_path = temp_dir.join(filename);
-
-    let response = ureq::get(url)
-        .set("User-Agent", "VibeTerm")
-        .call()
-        .map_err(|e| format!("下载请求失败：{}", e))?;
-
-    let mut reader = response.into_reader();
-    let mut file = std::fs::File::create(&dest_path)
-        .map_err(|e| format!("创建文件失败：{}", e))?;
-    
-    std::io::copy(&mut reader, &mut file)
-        .map_err(|e| format!("写入文件失败：{}", e))?;
-
-    Ok(dest_path)
-}
-
-fn fetch_latest_release() -> Result<GitHubRelease, String> {
-    let response = ureq::get(GITHUB_RELEASE_API)
-        .set("User-Agent", "VibeTerm")
-        .call()
-        .map_err(|e| format!("请求失败：{}", e))?;
-
-    let json: serde_json::Value = response
-        .into_json()
-        .map_err(|e| format!("解析响应失败：{}", e))?;
-
-    let tag_name = json["tag_name"]
-        .as_str()
-        .ok_or("缺少 tag_name 字段")?
-        .to_string();
-    let html_url = json["html_url"]
-        .as_str()
-        .ok_or("缺少 html_url 字段")?
-        .to_string();
-
-    let assets: Vec<ReleaseAsset> = json["assets"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|a| {
-                    Some(ReleaseAsset {
-                        name: a["name"].as_str()?.to_string(),
-                        browser_download_url: a["browser_download_url"].as_str()?.to_string(),
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    Ok(GitHubRelease { tag_name, html_url, assets })
-}
-
-// ============ Tab ============
-
-struct Tab {
-    title: String,
-    panes: Vec<Pane>,
-    active_pane: usize,
-}
-
-// ============ App ============
-
-struct App {
-    tabs: Vec<Tab>,
-    active_tab: usize,
-    shell_profiles: Vec<ShellProfile>,
-    active_shell: usize,
-    next_tab_id: usize,
-    next_pane_id: usize,
-    is_maximized: bool,
-    
-    // GUI state
-    fonts: Vec<FontInfo>,
-    selected_font: usize,
-    font_size: f32,
-    egui_ctx: egui::Context,
-    startup_directory: Option<PathBuf>,
-    show_settings: bool,
-    terminal_theme: TerminalThemeType,
-    update_checker: UpdateChecker,
-    
-    // IPC
-    ipc_receiver: IpcReceiver<IpcCommand>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct AppSettings {
-    selected_font_name: String,
-    font_size: f32,
-    terminal_theme: String,
-}
-
-impl Default for AppSettings {
-    fn default() -> Self {
-        Self {
-            selected_font_name: "Monospace".to_owned(),
-            font_size: 14.0,
-            terminal_theme: "One Dark Pro".to_owned(),
-        }
-    }
-}
-
-impl App {
-    fn new(cc: &eframe::CreationContext<'_>, ipc_receiver: IpcReceiver<IpcCommand>) -> Result<Self> {
-        // Setup fonts
-        let fonts = available_fonts();
-        let settings = load_settings();
-        let selected_font = fonts
-            .iter()
-            .position(|font| font.name == settings.selected_font_name)
-            .unwrap_or(0);
-        let mut app = Self {
-            tabs: Vec::new(),
-            active_tab: 0,
-            shell_profiles: available_shell_profiles(),
-            active_shell: 0,
-            next_tab_id: 1,
-            next_pane_id: 1,
-            is_maximized: false,
-            fonts,
-            selected_font,
-            font_size: settings.font_size.clamp(8.0, 32.0),
-            egui_ctx: cc.egui_ctx.clone(),
-            startup_directory: startup_directory_from_args(),
-            show_settings: false,
-            terminal_theme: TerminalThemeType::all()
-                .into_iter()
-                .find(|t| t.name() == settings.terminal_theme)
-                .unwrap_or(TerminalThemeType::OneDarkPro),
-            update_checker: UpdateChecker::default(),
-            ipc_receiver,
-        };
-        
-        app.apply_theme(&cc.egui_ctx);
-        app.apply_font(&cc.egui_ctx);
-        
-        // Add initial tab with an estimated terminal size, so the first shell prompt
-        // doesn't wrap incorrectly before the first real resize arrives.
-        app.add_tab_with_cwd(None)?;
-        Ok(app)
-    }
-
-    fn estimated_initial_terminal_size(&self) -> egui::Vec2 {
-        // Approximate the first pane's terminal area before the first frame layout.
-        // This avoids starting the PTY with the default ~80-column width, which can
-        // cause long cwd prompts to wrap until the window is resized.
-        egui::vec2(DEFAULT_WINDOW_WIDTH - 6.0, DEFAULT_WINDOW_HEIGHT - 38.0 - 24.0 - 4.0)
-    }
-    
-    fn apply_theme(&self, ctx: &egui::Context) {
-        let mut style = (*ctx.style()).clone();
-        style.visuals = one_dark_pro_visuals();
-        ctx.set_style(style);
-    }
-    
-    fn apply_font(&self, ctx: &egui::Context) {
-        let mut fonts = egui::FontDefinitions::default();
-
-        if cfg!(windows) {
-            for (name, file) in [
-                ("fallback_microsoft_yahei_ui", "msyh.ttc"),
-                ("fallback_microsoft_yahei", "msyhbd.ttc"),
-                ("fallback_simhei", "simhei.ttf"),
-                ("fallback_segoe_emoji", "seguiemj.ttf"),
-            ] {
-                let path = Path::new("C:\\Windows\\Fonts").join(file);
-                if let Ok(font_data) = std::fs::read(&path) {
-                    fonts.font_data.insert(
-                        name.to_owned(),
-                        egui::FontData::from_owned(font_data).into(),
-                    );
-                    fonts
-                        .families
-                        .entry(egui::FontFamily::Proportional)
-                        .or_default()
-                        .push(name.to_owned());
-                    fonts
-                        .families
-                        .entry(egui::FontFamily::Monospace)
-                        .or_default()
-                        .push(name.to_owned());
-                }
-            }
-        }
-
-        if let Some(font_info) = self.fonts.get(self.selected_font) {
-            if let Some(path) = &font_info.path {
-                if let Ok(font_data) = std::fs::read(path) {
-                    fonts.font_data.insert(
-                        "custom_font".to_owned(),
-                        egui::FontData::from_owned(font_data).into(),
-                    );
-                    fonts
-                        .families
-                        .entry(egui::FontFamily::Monospace)
-                        .or_default()
-                        .insert(0, "custom_font".to_owned());
-                }
-            }
-        }
-        ctx.set_fonts(fonts);
-    }
-    
-    fn active_tab(&self) -> &Tab {
-        &self.tabs[self.active_tab]
-    }
-    
-    fn active_tab_mut(&mut self) -> &mut Tab {
-        &mut self.tabs[self.active_tab]
-    }
-    
-    fn add_tab(&mut self) -> Result<()> {
-        self.add_tab_with_cwd(None)
-    }
-    
-    fn add_tab_with_cwd(&mut self, cwd: Option<PathBuf>) -> Result<()> {
-        let tab_id = self.next_tab_id;
-        self.next_tab_id += 1;
-        let initial_size = self
-            .tabs
-            .get(self.active_tab)
-            .and_then(|tab| tab.panes.get(tab.active_pane))
-            .and_then(|pane| pane.last_terminal_size)
-            .or_else(|| Some(self.estimated_initial_terminal_size()));
-        
-        let mut tab = Tab {
-            title: format!("Tab {}", tab_id),
-            panes: Vec::new(),
-            active_pane: 0,
-        };
-        tab.panes.push(self.create_pane_with_cwd(initial_size, cwd)?);
-        self.tabs.push(tab);
-        self.active_tab = self.tabs.len() - 1;
-        Ok(())
-    }
-    
-    fn set_shell(&mut self, index: usize) -> Result<()> {
-        if index < self.shell_profiles.len() && index != self.active_shell {
-            self.active_shell = index;
-            let initial_size = self.active_tab().panes.get(self.active_tab().active_pane)
-                .and_then(|pane| pane.last_terminal_size);
-            let new_pane = self.create_pane(initial_size)?;
-            let tab = self.active_tab_mut();
-            tab.panes[tab.active_pane] = new_pane;
-        }
-        Ok(())
-    }
-    
-    #[allow(dead_code)]
-    fn add_pane(&mut self) -> Result<()> {
-        self.add_pane_with_cwd(None)
-    }
-    
-    fn add_pane_with_cwd(&mut self, cwd: Option<PathBuf>) -> Result<()> {
-        if self.active_tab().panes.len() >= MAX_PANES {
-            return Ok(());
-        }
-        
-        let initial_size = self.active_tab().panes.get(self.active_tab().active_pane)
-            .and_then(|pane| pane.last_terminal_size);
-        let pane = self.create_pane_with_cwd(initial_size, cwd)?;
-        let tab = self.active_tab_mut();
-        tab.panes.push(pane);
-        tab.active_pane = tab.panes.len() - 1;
-        Ok(())
-    }
-    
-    #[allow(dead_code)]
-    fn close_active_pane(&mut self) {
-        let active_pane = self.active_tab().active_pane;
-        self.close_pane(active_pane);
-    }
-
-    fn close_pane(&mut self, index: usize) {
-        let tab = self.active_tab_mut();
-        if tab.panes.len() <= 1 || index >= tab.panes.len() {
-            return;
-        }
-        
-        tab.panes.remove(index);
-        if tab.active_pane >= tab.panes.len() {
-            tab.active_pane = tab.panes.len() - 1;
-        } else if index < tab.active_pane {
-            tab.active_pane -= 1;
-        }
-    }
-
-    #[allow(dead_code)]
-    fn close_active_tab(&mut self) {
-        self.close_tab(self.active_tab);
-    }
-
-    fn close_tab(&mut self, index: usize) {
-        if self.tabs.len() <= 1 {
-            return;
-        }
-
-        if index >= self.tabs.len() {
-            return;
-        }
-
-        self.tabs.remove(index);
-        if self.active_tab >= self.tabs.len() {
-            self.active_tab = self.tabs.len() - 1;
-        } else if index < self.active_tab {
-            self.active_tab -= 1;
-        }
-    }
-    
-    fn create_pane(&mut self, initial_size: Option<egui::Vec2>) -> Result<Pane> {
-        self.create_pane_with_cwd(initial_size, None)
-    }
-    
-    fn create_pane_with_cwd(&mut self, initial_size: Option<egui::Vec2>, cwd: Option<PathBuf>) -> Result<Pane> {
-        let pane_id = self.next_pane_id as u64;
-        self.next_pane_id += 1;
-        
-        let (sender, receiver) = channel();
-        let shell = &self.shell_profiles[self.active_shell];
-        
-        // Use provided cwd, fallback to startup_directory
-        let working_directory = cwd.or_else(|| self.startup_directory.clone());
-        
-        let settings = BackendSettings {
-            shell: shell.program.clone(),
-            args: shell.args.clone(),
-            working_directory,
-            initial_size: initial_size.map(|s| egui_term::Size::new(s.x, s.y)),
-        };
-        
-        let backend = TerminalBackend::new(pane_id, self.egui_ctx.clone(), sender, settings)?;
-        
-        Ok(Pane {
-            title: format!("Pane {}", pane_id),
-            backend,
-            receiver,
-            exited: false,
-            last_terminal_size: initial_size,
-        })
-    }
-    
-    fn focus_pane(&mut self, index: usize) {
-        let tab = self.active_tab_mut();
-        if index < tab.panes.len() {
-            tab.active_pane = index;
-        }
-    }
-
-    fn process_ipc_commands(&mut self) {
-        while let Ok(command) = self.ipc_receiver.try_recv() {
-            match command {
-                IpcCommand::AddPane { cwd } => {
-                    let cwd_path = cwd.map(PathBuf::from);
-                    let _ = self.add_pane_with_cwd(cwd_path);
-                }
-                IpcCommand::NewTab { cwd } => {
-                    let cwd_path = cwd.map(PathBuf::from);
-                    let _ = self.add_tab_with_cwd(cwd_path);
-                }
-            }
-        }
-    }
-
-    fn save_settings(&self) {
-        let settings = AppSettings {
-            selected_font_name: self
-                .fonts
-                .get(self.selected_font)
-                .map(|font| font.name.clone())
-                .unwrap_or_else(|| "Monospace".to_owned()),
-            font_size: self.font_size,
-            terminal_theme: self.terminal_theme.name().to_owned(),
-        };
-
-        if let Ok(json) = serde_json::to_string_pretty(&settings) {
-            let path = settings_path();
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let _ = std::fs::write(path, json);
-        }
-    }
-
-    fn show_settings_window(&mut self, ctx: &egui::Context) {
-        if !self.show_settings {
-            return;
-        }
-
-        // Poll for update check results
-        self.update_checker.poll();
-
-        let mut open = self.show_settings;
-        egui::Window::new("设置")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .default_width(360.0)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                ui.vertical(|ui| {
-                    ui.heading("终端设置");
-                    ui.add_space(8.0);
-
-                    egui::Grid::new("settings_grid")
-                        .num_columns(2)
-                        .spacing([40.0, 12.0])
-                        .show(ui, |ui| {
-                            ui.label("终端");
-                            let current_shell = &self.shell_profiles[self.active_shell].name;
-                            egui::ComboBox::from_id_salt("settings_shell_selector")
-                                .selected_text(current_shell)
-                                .width(150.0)
-                                .show_ui(ui, |ui| {
-                                    let choices = self
-                                        .shell_profiles
-                                        .iter()
-                                        .enumerate()
-                                        .map(|(i, profile)| (i, profile.name.clone()))
-                                        .collect::<Vec<_>>();
-                                    for (i, name) in choices {
-                                        if ui.selectable_label(i == self.active_shell, name).clicked() {
-                                            let _ = self.set_shell(i);
-                                            ui.close_menu();
-                                        }
-                                    }
-                                });
-                            ui.end_row();
-
-                            ui.label("字体");
-                            let current_font = self
-                                .fonts
-                                .get(self.selected_font)
-                                .map(|font| font.name.as_str())
-                                .unwrap_or("Monospace");
-                            egui::ComboBox::from_id_salt("settings_font_selector")
-                                .selected_text(current_font)
-                                .width(150.0)
-                                .show_ui(ui, |ui| {
-                                    let fonts = self
-                                        .fonts
-                                        .iter()
-                                        .enumerate()
-                                        .map(|(i, font)| (i, font.name.clone()))
-                                        .collect::<Vec<_>>();
-                                    for (i, name) in fonts {
-                                        if ui.selectable_label(i == self.selected_font, name).clicked() {
-                                            self.selected_font = i;
-                                            self.apply_font(ctx);
-                                            self.save_settings();
-                                            ui.close_menu();
-                                        }
-                                    }
-                                });
-                            ui.end_row();
-
-                            ui.label("字号");
-                            if ui
-                                .add(egui::Slider::new(&mut self.font_size, 8.0..=32.0).text("pt"))
-                                .changed()
-                            {
-                                self.save_settings();
-                            }
-                            ui.end_row();
-
-                            ui.label("终端主题");
-                            let current_theme = self.terminal_theme.name();
-                            egui::ComboBox::from_id_salt("settings_theme_selector")
-                                .selected_text(current_theme)
-                                .width(150.0)
-                                .show_ui(ui, |ui| {
-                                    for theme in TerminalThemeType::all() {
-                                        if ui.selectable_label(theme == self.terminal_theme, theme.name()).clicked() {
-                                            self.terminal_theme = theme;
-                                            self.save_settings();
-                                            ui.close_menu();
-                                        }
-                                    }
-                                });
-                            ui.end_row();
-                        });
-
-                    ui.add_space(16.0);
-                    ui.separator();
-                    ui.add_space(12.0);
-
-                    // Update check section
-                    ui.heading("更新");
-                    ui.add_space(8.0);
-
-                    egui::Frame::new()
-                        .fill(egui::Color32::from_rgb(33, 37, 43)) // One Dark Pro lighter background for card
-                        .corner_radius(6.0)
-                        .inner_margin(egui::Margin::same(12))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.vertical(|ui| {
-                                    ui.label(format!("当前版本：v{}", VERSION));
-                                    match &self.update_checker.status {
-                                        UpdateStatus::Idle => {}
-                                        UpdateStatus::Checking => {
-                                            ui.horizontal(|ui| {
-                                                ui.spinner();
-                                                ui.label(egui::RichText::new("正在检查更新...").color(egui::Color32::from_gray(150)));
-                                            });
-                                        }
-                                        UpdateStatus::UpToDate(version) => {
-                                            ui.label(egui::RichText::new(format!("✓ 当前已是最新版本（{}）", version)).color(egui::Color32::from_rgb(152, 195, 121)));
-                                        }
-                                        UpdateStatus::UpdateAvailable { version, .. } => {
-                                            ui.label(egui::RichText::new(format!("↑ 发现新版本：{}", version)).color(egui::Color32::from_rgb(229, 192, 123)));
-                                        }
-                                        UpdateStatus::Downloading { version, .. } => {
-                                            ui.horizontal(|ui| {
-                                                ui.spinner();
-                                                ui.label(egui::RichText::new(format!("正在下载 {}...", version)).color(egui::Color32::from_gray(150)));
-                                            });
-                                        }
-                                        UpdateStatus::LaunchingInstaller => {
-                                            ui.horizontal(|ui| {
-                                                ui.spinner();
-                                                ui.label(egui::RichText::new("安装包已下载，正在启动安装程序...").color(egui::Color32::from_gray(150)));
-                                            });
-                                        }
-                                        UpdateStatus::Error(msg) => {
-                                            ui.label(egui::RichText::new(format!("✗ {}", msg)).color(egui::Color32::from_rgb(224, 108, 117)));
-                                        }
-                                    }
-                                });
-
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    match &self.update_checker.status.clone() {
-                                        UpdateStatus::Idle | UpdateStatus::Error(_) => {
-                                            if ui.button("检查更新").clicked() {
-                                                self.update_checker.check_for_updates();
-                                            }
-                                        }
-                                        UpdateStatus::Checking => {}
-                                        UpdateStatus::UpToDate(_) => {
-                                            if ui.button("重新检查").clicked() {
-                                                self.update_checker.check_for_updates();
-                                            }
-                                        }
-                                        UpdateStatus::UpdateAvailable { version, url, installer_url } => {
-                                            if installer_url.is_some() {
-                                                if ui.button("立即更新").clicked() {
-                                                    self.update_checker.start_download(
-                                                        version.clone(),
-                                                        installer_url.clone().unwrap(),
-                                                    );
-                                                }
-                                            } else {
-                                                if ui.button("打开发布页面").clicked() {
-                                                    let _ = open_url(url);
-                                                }
-                                            }
-                                        }
-                                        UpdateStatus::Downloading { .. } => {}
-                                        UpdateStatus::LaunchingInstaller => {}
-                                    }
-                                });
-                            });
-                        });
-                });
-            });
-
-        self.show_settings = open;
-    }
-}
-
-impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Process IPC commands
-        self.process_ipc_commands();
-        
-        // Apply theme
-        self.apply_theme(ctx);
-        self.show_settings_window(ctx);
-        self.is_maximized = ctx.input(|input| input.viewport().maximized.unwrap_or(self.is_maximized));
-        
-        // Custom title bar with tabs, similar to Windows Terminal.
-        egui::TopBottomPanel::top("title_tab_bar")
-            .exact_height(38.0)
-            .show_separator_line(false)
-            .frame(
-                egui::Frame::new()
-                    .fill(egui::Color32::from_rgb(33, 37, 43))
-                    .inner_margin(egui::Margin::same(0))
-                    .outer_margin(egui::Margin::same(0))
-                    .stroke(egui::Stroke::NONE),
-            )
-            .show(ctx, |ui| {
-                let title_rect = ui.max_rect();
-                ui.painter().rect_filled(
-                    title_rect,
-                    0.0,
-                    egui::Color32::from_rgb(33, 37, 43),
-                );
-
-                let controls_width = 138.0;
-                let tabs_rect = egui::Rect::from_min_max(
-                    title_rect.min,
-                    egui::pos2(title_rect.max.x - controls_width, title_rect.max.y),
-                );
-                let drag_rect = egui::Rect::from_min_max(
-                    egui::pos2(tabs_rect.min.x, tabs_rect.min.y),
-                    egui::pos2(tabs_rect.max.x, tabs_rect.max.y),
-                );
-                let drag_response = ui.interact(
-                    drag_rect,
-                    ui.make_persistent_id("window_drag_area"),
-                    egui::Sense::drag(),
-                );
-                if drag_response.drag_started() {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                }
-
-                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(tabs_rect), |ui| {
-                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                if settings_title_button(ui) {
-                    self.show_settings = true;
-                }
-                ui.separator();
-
-                let tabs = self
-                    .tabs
-                    .iter()
-                    .enumerate()
-                    .map(|(i, tab)| (i, tab.title.clone()))
-                    .collect::<Vec<_>>();
-                let show_tab_close = tabs.len() > 1;
-                let mut close_tab = None;
-
-                for (i, title) in tabs {
-                    let is_active = i == self.active_tab;
-                    let tab_fill = if is_active {
-                        egui::Color32::from_rgb(45, 56, 70)
-                    } else {
-                        egui::Color32::from_rgb(33, 37, 43)
-                    };
-                    egui::Frame::new()
-                        .fill(tab_fill)
-                        .corner_radius(egui::CornerRadius::same(6))
-                        .inner_margin(egui::Margin::symmetric(8, 3))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                let tab_text_color = if is_active {
-                                    egui::Color32::from_rgb(220, 223, 228)
-                                } else {
-                                    egui::Color32::from_rgb(171, 178, 191)
-                                };
-                                let tab_label = egui::Label::new(
-                                    egui::RichText::new(title).color(tab_text_color),
-                                )
-                                .sense(egui::Sense::click());
-                                if ui.add(tab_label).clicked() {
-                                    self.active_tab = i;
-                                }
-                                if show_tab_close {
-                                    let response = ui.add(egui::Button::new("×").small());
-                                    if response.clicked() {
-                                        close_tab = Some(i);
-                                    }
-                                }
-                            });
-                        });
-                }
-
-                if let Some(index) = close_tab {
-                    self.close_tab(index);
-                    if self.active_tab >= self.tabs.len() {
-                        self.active_tab = self.tabs.len().saturating_sub(1);
-                    }
-                }
-
-                if ui.button("+").on_hover_text("新建标签页").clicked() {
-                    let _ = self.add_tab();
-                }
-                    });
-                });
-
-                let controls_rect = egui::Rect::from_min_max(
-                    egui::pos2(title_rect.max.x - controls_width, title_rect.min.y),
-                    title_rect.max,
-                );
-                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(controls_rect), |ui| {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if title_bar_button(ui, WindowButton::Close) {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
-                        if title_bar_button(ui, if self.is_maximized { WindowButton::Restore } else { WindowButton::Maximize }) {
-                            self.is_maximized = !self.is_maximized;
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(self.is_maximized));
-                        }
-                        if title_bar_button(ui, WindowButton::Minimize) {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-                        }
-                    });
-                });
-            });
-        
-        // Main content - Panes
-        egui::CentralPanel::default()
-            .frame(
-                egui::Frame::new()
-                    .fill(egui::Color32::from_rgb(40, 44, 52))
-                    .inner_margin(egui::Margin::same(0))
-                    .outer_margin(egui::Margin::same(0))
-                    .stroke(egui::Stroke::NONE),
-            )
-            .show(ctx, |ui| {
-            let pane_count = self.active_tab().panes.len();
-            let active_pane = self.active_tab().active_pane;
-            
-            // Calculate pane layout
-            let available_rect = ui.max_rect();
-            // Overlap the custom title bar by 1px to avoid a dark separator line
-            // between the tab/title bar and the pane border.
-            let pane_rects = calculate_pane_layout(available_rect, pane_count);
-            let terminal_font = TerminalFont::new(FontSettings {
-                font_type: egui::FontId::monospace(self.font_size),
-            });
-            let pane_border_style = one_dark_pro_pane_border_style();
-            let mut clicked_pane = None;
-            let mut close_pane = None;
-            let mut add_pane = false;
-            let show_close_button = pane_count > 1;
-            let show_add_button = pane_count < MAX_PANES;
-            let terminal_palette = Box::new(self.terminal_theme.palette());
-
-            // Render panes
-            let tab = self.active_tab_mut();
-            for (i, pane) in tab.panes.iter_mut().enumerate() {
-                let rect = pane_rects.get(i).copied().unwrap_or(available_rect);
-                let is_active = i == active_pane;
-                while let Ok((_, event)) = pane.receiver.try_recv() {
-                    if matches!(event, PtyEvent::Exit) {
-                        pane.exited = true;
-                    }
-                }
-                
-                // Create child UI at rect
-                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
-                    let pane_gap = 2.0;
-                    let top_gap = if (rect.min.y - available_rect.min.y).abs() < f32::EPSILON {
-                        0.0
-                    } else {
-                        pane_gap
-                    };
-                    let outer_rect = egui::Rect::from_min_max(
-                        egui::pos2(rect.min.x + pane_gap, rect.min.y + top_gap),
-                        egui::pos2(rect.max.x - pane_gap, rect.max.y - pane_gap),
-                    );
-                    let title_height = 24.0;
-                    let title_rect = egui::Rect::from_min_size(
-                        outer_rect.min,
-                        egui::vec2(outer_rect.width(), title_height),
-                    );
-                    let terminal_side_inset = 1.0;
-                    let terminal_bottom_inset = 1.0;
-                    let terminal_rect = egui::Rect::from_min_max(
-                        egui::pos2(
-                            outer_rect.min.x + terminal_side_inset,
-                            outer_rect.min.y + title_height,
-                        ),
-                        outer_rect.max - egui::vec2(terminal_side_inset, terminal_bottom_inset),
-                    );
-                    if ui.input(|input| {
-                        input.pointer.any_pressed()
-                            && input
-                                .pointer
-                                .interact_pos()
-                                .map(|pos| outer_rect.contains(pos))
-                                .unwrap_or(false)
-                    }) {
-                        clicked_pane = Some(i);
-                    }
-
-                    let show_active_accent = pane_count > 1 && is_active;
-                    let (border_color, title_fill, badge_fill) = if show_active_accent {
-                        (
-                            pane_border_style.active_border,
-                            pane_border_style.active_title_fill,
-                            pane_border_style.active_badge_fill,
-                        )
-                    } else {
-                        (
-                            pane_border_style.inactive_border,
-                            pane_border_style.inactive_title_fill,
-                            pane_border_style.inactive_badge_fill,
-                        )
-                    };
-                    let pane_corner_radius = egui::CornerRadius::ZERO;
-                    let title_corner_radius = egui::CornerRadius::ZERO;
-                    ui.painter().rect_filled(
-                        outer_rect,
-                        pane_corner_radius,
-                        pane_border_style.body_fill,
-                    );
-                    ui.painter().rect_filled(
-                        title_rect,
-                        title_corner_radius,
-                        title_fill,
-                    );
-                    let badge_rect = egui::Rect::from_min_size(
-                        title_rect.min + egui::vec2(7.0, 4.0),
-                        egui::vec2(28.0, 16.0),
-                    );
-                    ui.painter().rect_filled(badge_rect, 5.0, badge_fill);
-                    ui.painter().text(
-                        badge_rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        format!("#{}", i + 1),
-                        egui::FontId::proportional(11.0),
-                        pane_border_style.badge_text,
-                    );
-                    ui.painter().text(
-                        title_rect.min + egui::vec2(42.0, 5.0),
-                        egui::Align2::LEFT_TOP,
-                        if pane.exited {
-                            format!("{} · exited", pane.title)
-                        } else {
-                            pane.title.clone()
-                        },
-                        egui::FontId::proportional(12.0),
-                        pane_border_style.title_text,
-                    );
-                    let mut action_x = title_rect.max.x - 29.0;
-                    if show_close_button {
-                        let close_rect = egui::Rect::from_min_size(
-                            egui::pos2(action_x, title_rect.min.y + 4.0),
-                            egui::vec2(22.0, 16.0),
-                        );
-                        let close_id = ui.make_persistent_id(format!("close_pane_{}", pane.title));
-                        let close_response = ui.interact(close_rect, close_id, egui::Sense::click());
-                        let close_fill = if close_response.hovered() {
-                            egui::Color32::from_rgb(224, 108, 117)
-                        } else {
-                            egui::Color32::from_rgb(76, 84, 99)
-                        };
-                        ui.painter().rect_filled(close_rect, 5.0, close_fill);
-                        ui.painter().text(
-                            close_rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            "×",
-                            egui::FontId::proportional(14.0),
-                            egui::Color32::from_rgb(240, 243, 248),
-                        );
-                        if close_response.clicked() {
-                            close_pane = Some(i);
-                        }
-                        action_x -= 26.0;
-                    }
-                    if show_add_button {
-                        let add_rect = egui::Rect::from_min_size(
-                            egui::pos2(action_x, title_rect.min.y + 4.0),
-                            egui::vec2(22.0, 16.0),
-                        );
-                        let add_id = ui.make_persistent_id(format!("add_pane_{}", pane.title));
-                        let add_response = ui.interact(add_rect, add_id, egui::Sense::click());
-                        let add_fill = if add_response.hovered() {
-                            egui::Color32::from_rgb(152, 195, 121)
-                        } else {
-                            egui::Color32::from_rgb(76, 84, 99)
-                        };
-                        ui.painter().rect_filled(add_rect, 5.0, add_fill);
-                        ui.painter().text(
-                            add_rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            "+",
-                            egui::FontId::proportional(14.0),
-                            egui::Color32::from_rgb(30, 33, 39),
-                        );
-                        if add_response.clicked() {
-                            add_pane = true;
-                        }
-                    }
-                    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(terminal_rect), |ui| {
-                        let view = TerminalView::new(ui, &mut pane.backend)
-                            .set_focus(is_active)
-                            .set_size(terminal_rect.size())
-                            .set_font(terminal_font.clone())
-                            .set_theme(TerminalTheme::new(terminal_palette.clone()));
-                        ui.add(view);
-                    });
-                    // Save terminal size for future pane creation
-                    pane.last_terminal_size = Some(terminal_rect.size());
-                    ui.painter().rect_stroke(
-                        outer_rect,
-                        pane_corner_radius,
-                        egui::Stroke::new(2.0, border_color),
-                        egui::StrokeKind::Inside,
-                    );
-                });
-            }
-
-            if let Some(index) = clicked_pane {
-                self.focus_pane(index);
-            }
-            if let Some(index) = close_pane {
-                self.close_pane(index);
-            } else if add_pane {
-                let _ = self.add_pane();
-            }
-        });
-        
-        // Request continuous repaint for terminal updates
-        ctx.request_repaint();
-    }
-}
-
-#[derive(Clone, Copy)]
-enum WindowButton {
-    Minimize,
-    Maximize,
-    Restore,
-    Close,
-}
-
-fn settings_title_button(ui: &mut egui::Ui) -> bool {
-    let size = egui::vec2(38.0, 38.0);
-    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
-    let fill = if response.hovered() {
-        egui::Color32::from_rgb(50, 56, 66)
-    } else {
-        egui::Color32::TRANSPARENT
-    };
-
-    ui.painter().rect_filled(rect, 0.0, fill);
-    ui.painter().text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        "⚙",
-        egui::FontId::proportional(16.0),
-        egui::Color32::from_rgb(220, 223, 228),
-    );
-
-    response.clicked()
-}
-
-fn title_bar_button(ui: &mut egui::Ui, button: WindowButton) -> bool {
-    let size = egui::vec2(46.0, 38.0);
-    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
-    let fill = if response.hovered() {
-        match button {
-            WindowButton::Close => egui::Color32::from_rgb(196, 43, 28),
-            _ => egui::Color32::from_rgb(50, 56, 66),
-        }
-    } else {
-        egui::Color32::TRANSPARENT
-    };
-    let stroke = egui::Stroke::new(
-        1.2,
-        if response.hovered() && matches!(button, WindowButton::Close) {
-            egui::Color32::WHITE
-        } else {
-            egui::Color32::from_rgb(220, 223, 228)
-        },
-    );
-
-    ui.painter().rect_filled(rect, 0.0, fill);
-    let center = rect.center();
-    match button {
-        WindowButton::Minimize => {
-            ui.painter().line_segment(
-                [center + egui::vec2(-5.0, 0.0), center + egui::vec2(5.0, 0.0)],
-                stroke,
-            );
-        }
-        WindowButton::Maximize => {
-            let icon_rect = egui::Rect::from_center_size(center, egui::vec2(10.0, 10.0));
-            ui.painter().rect_stroke(icon_rect, 0.0, stroke, egui::StrokeKind::Inside);
-        }
-        WindowButton::Restore => {
-            let back = egui::Rect::from_center_size(center + egui::vec2(2.5, -2.5), egui::vec2(9.0, 9.0));
-            let front = egui::Rect::from_center_size(center + egui::vec2(-1.5, 1.5), egui::vec2(9.0, 9.0));
-            ui.painter().rect_stroke(back, 0.0, stroke, egui::StrokeKind::Inside);
-            ui.painter().rect_filled(front.expand(1.0), 0.0, egui::Color32::from_rgb(33, 37, 43));
-            ui.painter().rect_stroke(front, 0.0, stroke, egui::StrokeKind::Inside);
-        }
-        WindowButton::Close => {
-            ui.painter().line_segment(
-                [center + egui::vec2(-5.0, -5.0), center + egui::vec2(5.0, 5.0)],
-                stroke,
-            );
-            ui.painter().line_segment(
-                [center + egui::vec2(5.0, -5.0), center + egui::vec2(-5.0, 5.0)],
-                stroke,
-            );
-        }
-    }
-
-    response.clicked()
-}
-
-fn calculate_pane_layout(rect: egui::Rect, pane_count: usize) -> Vec<egui::Rect> {
-    if pane_count == 0 {
-        return Vec::new();
-    }
-    
-    let x = rect.min.x;
-    let y = rect.min.y;
-    let w = rect.width();
-    let h = rect.height();
-    
-    match pane_count {
-        1 => vec![rect],
-        2 => {
-            let half_w = w / 2.0;
-            vec![
-                egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(half_w, h)),
-                egui::Rect::from_min_size(egui::pos2(x + half_w, y), egui::vec2(w - half_w, h)),
-            ]
-        }
-        3 => {
-            let third_w = w / 3.0;
-            vec![
-                egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(third_w, h)),
-                egui::Rect::from_min_size(egui::pos2(x + third_w, y), egui::vec2(third_w, h)),
-                egui::Rect::from_min_size(egui::pos2(x + 2.0 * third_w, y), egui::vec2(w - 2.0 * third_w, h)),
-            ]
-        }
-        4 => {
-            // 1 2 3
-            // 4 2 3
-            let third_w = w / 3.0;
-            let half_h = h / 2.0;
-            vec![
-                egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(third_w, half_h)),
-                egui::Rect::from_min_size(egui::pos2(x + third_w, y), egui::vec2(third_w, h)),
-                egui::Rect::from_min_size(egui::pos2(x + 2.0 * third_w, y), egui::vec2(w - 2.0 * third_w, h)),
-                egui::Rect::from_min_size(egui::pos2(x, y + half_h), egui::vec2(third_w, h - half_h)),
-            ]
-        }
-        5 => {
-            // 1 2 3
-            // 4 5 3
-            let third_w = w / 3.0;
-            let half_h = h / 2.0;
-            vec![
-                egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(third_w, half_h)),
-                egui::Rect::from_min_size(egui::pos2(x + third_w, y), egui::vec2(third_w, half_h)),
-                egui::Rect::from_min_size(egui::pos2(x + 2.0 * third_w, y), egui::vec2(w - 2.0 * third_w, h)),
-                egui::Rect::from_min_size(egui::pos2(x, y + half_h), egui::vec2(third_w, h - half_h)),
-                egui::Rect::from_min_size(egui::pos2(x + third_w, y + half_h), egui::vec2(third_w, h - half_h)),
-            ]
-        }
-        _ => {
-            // 6 panes: 2x3 grid
-            let third_w = w / 3.0;
-            let half_h = h / 2.0;
-            vec![
-                egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(third_w, half_h)),
-                egui::Rect::from_min_size(egui::pos2(x + third_w, y), egui::vec2(third_w, half_h)),
-                egui::Rect::from_min_size(egui::pos2(x + 2.0 * third_w, y), egui::vec2(w - 2.0 * third_w, half_h)),
-                egui::Rect::from_min_size(egui::pos2(x, y + half_h), egui::vec2(third_w, h - half_h)),
-                egui::Rect::from_min_size(egui::pos2(x + third_w, y + half_h), egui::vec2(third_w, h - half_h)),
-                egui::Rect::from_min_size(egui::pos2(x + 2.0 * third_w, y + half_h), egui::vec2(w - 2.0 * third_w, h - half_h)),
-            ]
-        }
-    }
-}
-
-// ============ Shell Profile Functions ============
-
 fn available_shell_profiles() -> Vec<ShellProfile> {
     let mut profiles = Vec::new();
-    
+
     if cfg!(windows) {
-        push_if_available(&mut profiles, "PowerShell 7", "pwsh.exe", []);
-        push_if_available(&mut profiles, "PowerShell", "powershell.exe", []);
+        push_if_available(&mut profiles, "PowerShell 7", "pwsh.exe", ["-NoLogo"]);
+        push_if_available(&mut profiles, "PowerShell", "powershell.exe", ["-NoLogo"]);
         push_if_available(&mut profiles, "Command Prompt", "cmd.exe", []);
-        push_if_available(&mut profiles, "Git Bash", r"C:\Program Files\Git\bin\bash.exe", ["--login"]);
+        push_if_available(
+            &mut profiles,
+            "Git Bash",
+            r"C:\Program Files\Git\bin\bash.exe",
+            ["--login"],
+        );
     } else {
         if let Ok(shell) = env::var("SHELL") {
             profiles.push(ShellProfile {
@@ -1637,7 +1670,7 @@ fn available_shell_profiles() -> Vec<ShellProfile> {
         push_if_available(&mut profiles, "fish", "/usr/bin/fish", ["-l"]);
         push_if_available(&mut profiles, "sh", "/bin/sh", []);
     }
-    
+
     if profiles.is_empty() {
         profiles.push(ShellProfile {
             name: "Default Shell".to_owned(),
@@ -1649,7 +1682,7 @@ fn available_shell_profiles() -> Vec<ShellProfile> {
             args: Vec::new(),
         });
     }
-    
+
     profiles
 }
 
@@ -1672,204 +1705,1770 @@ fn program_available(program: &str) -> bool {
     if Path::new(program).is_file() {
         return true;
     }
-    
+
     if program.contains(['/', '\\']) {
         return false;
     }
-    
+
     env::var_os("PATH")
         .map(|paths| env::split_paths(&paths).any(|path| path.join(program).is_file()))
         .unwrap_or(false)
 }
 
-fn load_settings() -> AppSettings {
-    std::fs::read_to_string(settings_path())
-        .ok()
-        .and_then(|contents| serde_json::from_str(&contents).ok())
-        .unwrap_or_default()
-}
-
-fn settings_path() -> std::path::PathBuf {
-    let base = if cfg!(windows) {
-        env::var_os("APPDATA")
-            .map(std::path::PathBuf::from)
-            .or_else(|| env::var_os("USERPROFILE").map(std::path::PathBuf::from))
-    } else {
-        env::var_os("XDG_CONFIG_HOME")
-            .map(std::path::PathBuf::from)
-            .or_else(|| {
-                env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".config"))
-            })
-    }
-    .unwrap_or_else(|| std::path::PathBuf::from("."));
-
-    base.join("VibeTerm").join("settings.json")
-}
-
-fn startup_directory_from_args() -> Option<PathBuf> {
-    let args = parse_cli_args();
-    args.cwd.or_else(default_startup_directory)
-}
-
-fn default_startup_directory() -> Option<PathBuf> {
-    env::var_os("USERPROFILE")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(PathBuf::from))
-}
-
-// ============ IPC Functions ============
-
-fn try_bind_ipc_port() -> Option<TcpListener> {
-    TcpListener::bind((IPC_HOST, IPC_PORT)).ok()
-}
-
 fn send_ipc_command(command: &IpcCommand) -> bool {
     let addr = format!("{}:{}", IPC_HOST, IPC_PORT);
     if let Ok(mut stream) = TcpStream::connect_timeout(
-        &addr.parse().unwrap(),
+        &addr.parse().expect("valid IPC address"),
         Duration::from_millis(500),
     ) {
         let json = serde_json::to_string(command).unwrap_or_default();
-        if stream.write_all(json.as_bytes()).is_ok() {
-            return true;
-        }
+        return stream.write_all(json.as_bytes()).is_ok();
     }
     false
 }
 
-fn start_ipc_server() -> (IpcReceiver<IpcCommand>, std::thread::JoinHandle<()>) {
-    let (sender, receiver) = unbounded();
-    
-    let handle = thread::spawn(move || {
-        if let Ok(listener) = TcpListener::bind((IPC_HOST, IPC_PORT)) {
-            listener.set_nonblocking(true).ok();
-            loop {
-                match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        stream.set_read_timeout(Some(Duration::from_millis(100))).ok();
-                        let mut buf = [0u8; 4096];
-                        if let Ok(n) = stream.read(&mut buf) {
-                            if n > 0 {
-                                if let Ok(json) = std::str::from_utf8(&buf[..n]) {
-                                    if let Ok(command) = serde_json::from_str::<IpcCommand>(json) {
-                                        let _ = sender.send(command);
-                                    }
+fn start_ipc_server(proxy: EventLoopProxy<AppEvent>) {
+    let Ok(listener) = TcpListener::bind((IPC_HOST, IPC_PORT)) else {
+        return;
+    };
+
+    thread::spawn(move || {
+        listener.set_nonblocking(true).ok();
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_millis(100)))
+                        .ok();
+                    let mut buf = [0u8; 4096];
+                    if let Ok(n) = stream.read(&mut buf) {
+                        if n > 0 {
+                            if let Ok(text) = std::str::from_utf8(&buf[..n]) {
+                                if let Ok(command) = serde_json::from_str::<IpcCommand>(text) {
+                                    let _ = proxy.send_event(AppEvent::Ipc(command));
                                 }
                             }
                         }
                     }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(_) => {
-                        thread::sleep(Duration::from_millis(50));
-                    }
                 }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(100));
+                }
+                Err(_) => break,
             }
         }
     });
-    
-    (receiver, handle)
 }
 
-fn open_url(url: &str) -> Result<()> {
-    #[cfg(target_os = "windows")]
-    {
-        std::process::Command::new("cmd")
-            .args(["/C", "start", url])
-            .spawn()?;
+fn index_html() -> String {
+    let html = r##"<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; font-src data:; img-src data:;">
+  <title>VibeTerm</title>
+  <style id="xterm-css">
+__XTERM_CSS__
+  </style>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0f1219;
+      --panel: #171b25;
+      --panel-strong: #202636;
+      --border: #2d3447;
+      --text: #dcdfe4;
+      --muted: #8f98ad;
+      --accent: #c678dd;
+      --accent-2: #61afef;
+      --terminal-font-family: Cascadia Mono, Cascadia Code, Consolas, monospace;
     }
-    #[cfg(target_os = "macos")]
-    {
-        std::process::Command::new("open")
-            .arg(url)
-            .spawn()?;
+
+    * {
+      box-sizing: border-box;
     }
-    #[cfg(target_os = "linux")]
-    {
-        std::process::Command::new("xdg-open")
-            .arg(url)
-            .spawn()?;
+
+    html, body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
     }
-    Ok(())
-}
 
-fn load_app_icon() -> Result<IconData> {
-    let image = image::load_from_memory(APP_ICON_PNG)
-        .map_err(|e| anyhow::anyhow!("Failed to decode app icon: {e}"))?
-        .into_rgba8();
-    let (width, height) = image.dimensions();
+    #app {
+      width: 100%;
+      height: 100%;
+      min-width: 0;
+      min-height: 0;
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      position: relative;
+      background: var(--bg);
+      color: var(--text);
+      font-family: "Segoe UI", system-ui, sans-serif;
+    }
 
-    Ok(IconData {
-        rgba: image.into_raw(),
-        width,
-        height,
-    })
-}
+    #titleBar {
+      height: 36px;
+      display: flex;
+      align-items: stretch;
+      border-bottom: 1px solid var(--border);
+      background: var(--panel);
+      user-select: none;
+    }
 
-// ============ Main ============
+    .brand {
+      display: flex;
+      align-items: center;
+      padding: 0 12px;
+      color: var(--accent);
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+    }
 
-fn main() -> Result<()> {
-    // Parse command line arguments
-    let cli_args = parse_cli_args();
-    
-    // Handle action if specified
-    if let Some(action) = &cli_args.action {
-        let command = match action.as_str() {
-            "add-pane" => IpcCommand::AddPane {
-                cwd: cli_args.cwd.map(|p| p.to_string_lossy().to_string()),
-            },
-            "new-tab" => IpcCommand::NewTab {
-                cwd: cli_args.cwd.map(|p| p.to_string_lossy().to_string()),
-            },
-            _ => {
-                // Unknown action, just start normally
-                return run_main_instance();
-            }
-        };
-        
-        // Try to send to existing instance
-        if send_ipc_command(&command) {
-            // Successfully sent, exit
-            return Ok(());
+    #tabBar {
+      display: flex;
+      align-items: stretch;
+      gap: 0;
+      min-width: 0;
+      max-width: 62vw;
+      overflow: hidden;
+    }
+
+    #tabBar button {
+      height: 36px;
+      min-width: 96px;
+      max-width: 160px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      border: 0;
+      border-radius: 0;
+      background: transparent;
+      color: var(--muted);
+      padding: 0 8px 0 12px;
+      overflow: hidden;
+      white-space: nowrap;
+    }
+
+    #tabBar button:hover {
+      background: rgba(255, 255, 255, 0.04);
+      color: var(--text);
+    }
+
+    #tabBar button.active {
+      position: relative;
+      z-index: 2;
+      margin-bottom: -1px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-bottom: 0;
+      border-radius: 6px 6px 0 0;
+      color: white;
+      box-shadow: inset 0 2px 0 var(--accent), 0 1px 0 var(--bg);
+    }
+
+    .tab-title {
+      flex: 1;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .tab-close {
+      width: 18px;
+      height: 18px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 4px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1;
+      flex: 0 0 auto;
+    }
+
+    .tab-close[hidden],
+    .pane-action[hidden] {
+      display: none !important;
+    }
+
+    .tab-close:hover {
+      background: rgba(255, 255, 255, 0.12);
+      color: var(--text);
+    }
+
+    #newTabButton {
+      width: 36px;
+      height: 36px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border: 0;
+      border-radius: 0;
+      background: transparent;
+      color: var(--muted);
+      font-size: 18px;
+      line-height: 1;
+      cursor: pointer;
+    }
+
+    #newTabButton:hover {
+      background: rgba(255, 255, 255, 0.04);
+      color: var(--text);
+    }
+
+    .titlebar-drag {
+      flex: 1;
+      min-width: 40px;
+    }
+
+    #windowControls {
+      display: flex;
+      margin-left: auto;
+    }
+
+    .window-control {
+      width: 46px;
+      height: 35px;
+      border: 0;
+      border-radius: 0;
+      background: transparent;
+      color: var(--text);
+      padding: 0;
+      font-family: "Segoe MDL2 Assets", "Segoe UI Symbol", sans-serif;
+      font-size: 10px;
+    }
+
+    .window-control:hover {
+      background: rgba(255, 255, 255, 0.1);
+    }
+
+    .window-control.close:hover {
+      background: #c42b1c;
+      color: white;
+    }
+
+    #titleBar #newTabButton {
+      min-width: 36px;
+      border: 0;
+      border-radius: 0;
+      background: transparent;
+      padding: 0;
+    }
+
+    #windowControls .window-control {
+      border: 0;
+      border-radius: 0;
+      background: transparent;
+      padding: 0;
+    }
+
+    #windowControls .window-control:hover {
+      background: rgba(255, 255, 255, 0.1);
+      border-color: transparent;
+    }
+
+    #windowControls .window-control.close:hover {
+      background: #c42b1c;
+      color: white;
+    }
+
+    #settingsPanel {
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      z-index: 10;
+      width: min(420px, calc(100vw - 48px));
+      padding: 16px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: var(--panel);
+      box-shadow: 0 16px 40px rgba(0, 0, 0, 0.35);
+      color: var(--text);
+    }
+
+    #settingsPanel[hidden] {
+      display: none;
+    }
+
+    .settings-title {
+      margin-bottom: 14px;
+      font-size: 15px;
+      font-weight: 600;
+    }
+
+    .settings-content {
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+
+    .settings-column {
+      min-width: 0;
+    }
+
+    .settings-column + .settings-column {
+      padding-top: 14px;
+      border-top: 1px solid var(--border);
+    }
+
+    .settings-row {
+      display: grid;
+      grid-template-columns: 56px minmax(0, 1fr);
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 12px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .settings-row select,
+    .settings-row input[type="number"] {
+      width: 100%;
+      height: 32px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: #0b0e14;
+      color: var(--text);
+      padding: 0 10px;
+      font: inherit;
+    }
+
+    .settings-row select:focus,
+    .settings-row input[type="number"]:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+
+    .settings-section {
+      margin: 0;
+    }
+
+    .settings-section-title {
+      margin-bottom: 10px;
+      color: var(--text);
+      font-size: 13px;
+      font-weight: 600;
+    }
+
+    .settings-version,
+    .update-status {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.5;
+    }
+
+    .settings-version {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 12px;
+      padding: 10px;
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.025);
+    }
+
+    #appVersionText {
+      color: var(--text);
+      font-weight: 600;
+    }
+
+    .update-status {
+      min-height: 18px;
+      margin: 10px 0 12px;
+    }
+
+    .update-status.success {
+      color: #98c379;
+    }
+
+    .update-status.warning {
+      color: #e5c07b;
+    }
+
+    .update-status.error {
+      color: #e06c75;
+    }
+
+    .settings-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+    }
+
+    .settings-primary-action {
+      width: 100%;
+      height: 34px;
+      border: 1px solid rgba(198, 120, 221, 0.65);
+      border-radius: 8px;
+      background: rgba(198, 120, 221, 0.14);
+      color: #f1d6ff;
+      font-weight: 600;
+    }
+
+    .settings-primary-action:hover:not(:disabled) {
+      background: rgba(198, 120, 221, 0.22);
+    }
+
+    .settings-primary-action:disabled {
+      cursor: default;
+      opacity: 0.65;
+    }
+
+    #statusBar {
+      position: absolute;
+      right: 10px;
+      bottom: 10px;
+      z-index: 20;
+      max-width: min(520px, calc(100% - 20px));
+      min-height: 26px;
+      display: flex;
+      align-items: center;
+      padding: 0 10px;
+      background: rgba(23, 27, 37, 0.94);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--muted);
+      font-size: 12px;
+      pointer-events: none;
+      user-select: none;
+    }
+
+    #statusBar[hidden] {
+      display: none;
+    }
+
+    button {
+      border: 1px solid var(--border);
+      background: var(--panel-strong);
+      color: var(--text);
+      border-radius: 8px;
+      padding: 6px 10px;
+      font: inherit;
+      cursor: pointer;
+    }
+
+    button:hover {
+      border-color: var(--accent-2);
+    }
+
+    #workspace {
+      flex: 1 1 0;
+      min-height: 0;
+      padding: 0;
+      background: var(--bg);
+      overflow: hidden;
+    }
+
+    .tab-content {
+      display: none;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+    }
+
+    .tab-content.active {
+      display: grid;
+      align-items: stretch;
+      justify-items: stretch;
+    }
+
+    .pane {
+      width: 100%;
+      height: 100%;
+      min-width: 0;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      border: 1px solid var(--border);
+      border-radius: 0;
+      background: #0b0e14;
+      overflow: hidden;
+    }
+
+    .pane.active {
+      border-color: var(--accent);
+      box-shadow: none;
+    }
+
+    .pane-header {
+      height: 28px;
+      flex: 0 0 28px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 0 8px;
+      border-bottom: 1px solid var(--border);
+      background: var(--panel);
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .pane.active .pane-header {
+      color: var(--text);
+    }
+
+    .pane-cwd {
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .pane-action {
+      width: 20px;
+      height: 20px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border: 0;
+      border-radius: 4px;
+      background: transparent;
+      color: var(--muted);
+      font-size: 11px;
+      padding: 0;
+      cursor: pointer;
+      line-height: 1;
+    }
+
+    .pane-action.close {
+      width: 24px;
+      height: 24px;
+      color: #e06c75;
+      font-size: 15px;
+      font-weight: 700;
+    }
+
+    .pane-action.add {
+      width: 24px;
+      height: 24px;
+      color: var(--accent-2);
+      font-size: 18px;
+      font-weight: 700;
+    }
+
+    .pane-action:hover {
+      background: rgba(255, 255, 255, 0.1);
+      color: var(--text);
+    }
+
+    .pane-action.close:hover {
+      background: #c42b1c;
+      color: white;
+    }
+
+    .pane-action.add:hover {
+      color: var(--accent);
+    }
+
+    .terminal {
+      flex: 1 1 0;
+      position: relative;
+      width: 100%;
+      min-width: 0;
+      min-height: 0;
+      padding: 0;
+      overflow: hidden;
+      background: #0b0e14;
+      font-family: var(--terminal-font-family) !important;
+    }
+
+    .terminal .xterm,
+    .terminal .xterm-screen,
+    .terminal .xterm-rows,
+    .terminal .xterm-rows > div,
+    .terminal textarea {
+      font-family: var(--terminal-font-family) !important;
+    }
+
+    .terminal > .xterm {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+    }
+
+    .terminal .xterm-viewport {
+      overflow-y: hidden !important;
+      scrollbar-width: none;
+    }
+
+    .terminal .xterm-viewport::-webkit-scrollbar {
+      display: none;
+    }
+
+    .xterm {
+      width: 100%;
+      height: 100%;
+    }
+
+    #status {
+      margin-left: auto;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <div id="titleBar">
+      <div class="brand">VIBETERM</div>
+      <div id="tabBar"></div>
+      <div id="newTabButton" role="button" title="新建标签页">+</div>
+      <div class="titlebar-drag"></div>
+      <div id="windowControls">
+        <button id="settingsButton" class="window-control" title="设置">&#xE713;</button>
+        <button id="windowMinimize" class="window-control" title="最小化">&#xE921;</button>
+        <button id="windowMaximize" class="window-control" title="最大化">&#xE922;</button>
+        <button id="windowClose" class="window-control close" title="关闭">&#xE8BB;</button>
+      </div>
+    </div>
+    <div id="settingsPanel" hidden>
+      <div class="settings-title">终端设置</div>
+      <div class="settings-content">
+        <div class="settings-column">
+          <div class="settings-section-title">显示</div>
+          <label class="settings-row">
+            <span>字体</span>
+            <select id="terminalFontSelect">
+              <option value="Cascadia Mono, Cascadia Code, Consolas, monospace">加载系统字体...</option>
+            </select>
+          </label>
+          <label class="settings-row">
+            <span>字号</span>
+            <input id="terminalFontSizeInput" type="number" min="10" max="32" step="1" value="14">
+          </label>
+          <div class="settings-actions">
+            <button id="resetFontButton" type="button">重置</button>
+          </div>
+        </div>
+        <div class="settings-column">
+          <div class="settings-section">
+            <div class="settings-section-title">更新</div>
+            <div class="settings-version">
+              <span>当前版本</span>
+              <span id="appVersionText">-</span>
+            </div>
+            <div id="updateStatus" class="update-status">未检查更新</div>
+            <button id="checkUpdateButton" class="settings-primary-action" type="button">检查更新</button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div id="workspace"></div>
+    <div id="statusBar"><span id="status">Loading xterm.js...</span></div>
+  </div>
+  <script>
+    (function () {
+      if (typeof window.queueMicrotask !== 'function') {
+        window.queueMicrotask = callback => Promise.resolve()
+          .then(callback)
+          .catch(error => setTimeout(() => { throw error; }, 0));
+      }
+
+      try {
+        if (!navigator.platform) {
+          Object.defineProperty(navigator, 'platform', {
+            value: (navigator.userAgentData && navigator.userAgentData.platform) || 'Win32',
+            configurable: true,
+          });
         }
-        
-        // No existing instance, start as main instance
-        // The cwd will be used for initial tab/pane
-    }
-    
-    run_main_instance()
-}
+      } catch (error) {}
 
-fn run_main_instance() -> Result<()> {
-    // Try to bind IPC port to become the main instance
-    let ipc_receiver = if let Some(_listener) = try_bind_ipc_port() {
-        // We are the main instance, start IPC server
-        let (receiver, _handle) = start_ipc_server();
-        receiver
+      if (typeof window.ResizeObserver !== 'function') {
+        window.ResizeObserver = class {
+          constructor(callback) {
+            this.callback = callback;
+            this.entries = new Map();
+            this.timer = null;
+          }
+
+          observe(element) {
+            this.entries.set(element, { width: 0, height: 0 });
+            if (this.timer === null) {
+              this.timer = setInterval(() => this.check(), 160);
+            }
+            this.check();
+          }
+
+          unobserve(element) {
+            this.entries.delete(element);
+            if (this.entries.size === 0) {
+              this.disconnect();
+            }
+          }
+
+          disconnect() {
+            if (this.timer !== null) {
+              clearInterval(this.timer);
+              this.timer = null;
+            }
+            this.entries.clear();
+          }
+
+          check() {
+            const changed = [];
+            for (const [element, previous] of this.entries) {
+              const rect = element.getBoundingClientRect();
+              if (rect.width !== previous.width || rect.height !== previous.height) {
+                this.entries.set(element, { width: rect.width, height: rect.height });
+                changed.push({ target: element, contentRect: rect });
+              }
+            }
+            if (changed.length > 0) {
+              this.callback(changed, this);
+            }
+          }
+        };
+      }
+
+      function showStartupError(message) {
+        const status = document.getElementById('status');
+        const statusBar = document.getElementById('statusBar');
+        if (status) status.textContent = message;
+        if (statusBar) statusBar.hidden = false;
+      }
+
+      function reportStartupError(payload) {
+        if (window.ipc && typeof window.ipc.postMessage === 'function') {
+          window.ipc.postMessage(JSON.stringify({
+            type: 'frontendError',
+            message: payload.message || 'unknown error',
+            source: payload.source || '',
+            line: payload.line || 0,
+            column: payload.column || 0,
+            stack: payload.stack || '',
+          }));
+        }
+      }
+
+      window.addEventListener('error', (event) => {
+        const message = event.message || 'unknown error';
+        showStartupError(`前端脚本错误：${message}`);
+        reportStartupError({
+          message,
+          source: event.filename,
+          line: event.lineno,
+          column: event.colno,
+          stack: event.error && event.error.stack ? String(event.error.stack) : '',
+        });
+      });
+
+      window.addEventListener('unhandledrejection', (event) => {
+        const reason = event.reason && (event.reason.message || event.reason);
+        const message = reason || 'unknown error';
+        showStartupError(`前端异步错误：${message}`);
+        reportStartupError({
+          message,
+          stack: event.reason && event.reason.stack ? String(event.reason.stack) : '',
+        });
+      });
+    })();
+  </script>
+  <script>
+__XTERM_JS__
+  </script>
+  <script>
+__XTERM_ADDON_FIT_JS__
+  </script>
+  <script>
+__XTERM_ADDON_CLIPBOARD_JS__
+  </script>
+  <script>
+    const tabs = new Map();
+    const panes = new Map();
+    const pendingOutput = new Map();
+    const fallbackCols = 120;
+    const fallbackRows = 30;
+    let activeTabId = null;
+    let activePaneId = null;
+    let maxPanesPerTab = 6;
+    let systemFontFamilies = [];
+
+    const titleBar = document.getElementById('titleBar');
+    const tabBar = document.getElementById('tabBar');
+    const newTabButton = document.getElementById('newTabButton');
+    const settingsButton = document.getElementById('settingsButton');
+    const settingsPanel = document.getElementById('settingsPanel');
+    const terminalFontSelect = document.getElementById('terminalFontSelect');
+    const terminalFontSizeInput = document.getElementById('terminalFontSizeInput');
+    const resetFontButton = document.getElementById('resetFontButton');
+    const appVersionText = document.getElementById('appVersionText');
+    const updateStatus = document.getElementById('updateStatus');
+    const checkUpdateButton = document.getElementById('checkUpdateButton');
+    const workspace = document.getElementById('workspace');
+    const statusBar = document.getElementById('statusBar');
+    const status = document.getElementById('status');
+
+    const defaultTerminalFont = 'Cascadia Mono, Cascadia Code, Consolas, monospace';
+    const defaultTerminalFontSize = 14;
+    const minTerminalFontSize = 10;
+    const maxTerminalFontSize = 32;
+    const terminalSettings = {
+      fontFamily: defaultTerminalFont,
+      fontSize: defaultTerminalFontSize,
+    };
+    let appVersion = '';
+    let latestUpdate = null;
+    let updateCheckInFlight = false;
+    let updateInstallInFlight = false;
+    let updateButtonMode = 'check';
+
+    function makeTerminalOptions() {
+      return {
+      cursorBlink: true,
+      fontFamily: terminalSettings.fontFamily,
+      fontSize: terminalSettings.fontSize,
+      lineHeight: 1.2,
+      scrollback: 10000,
+      scrollbarWidth: 0,
+      theme: {
+        background: '#0b0e14',
+        foreground: '#dcdfe4',
+        cursor: '#c678dd',
+        selectionBackground: '#3e4451',
+        black: '#282c34',
+        red: '#e06c75',
+        green: '#98c379',
+        yellow: '#e5c07b',
+        blue: '#61afef',
+        magenta: '#c678dd',
+        cyan: '#56b6c2',
+        white: '#abb2bf',
+        brightBlack: '#5c6370',
+        brightRed: '#e06c75',
+        brightGreen: '#98c379',
+        brightYellow: '#e5c07b',
+        brightBlue: '#61afef',
+        brightMagenta: '#c678dd',
+        brightCyan: '#56b6c2',
+        brightWhite: '#ffffff',
+      },
+    };
+    }
+
+    function post(message) {
+      if (window.ipc && typeof window.ipc.postMessage === 'function') {
+        window.ipc.postMessage(JSON.stringify(message));
+      }
+    }
+
+    function setStatus(message) {
+      const text = message || '';
+      status.textContent = text;
+      statusBar.hidden = text.length === 0;
+    }
+
+    function activePane() {
+      return panes.get(activePaneId) || null;
+    }
+
+    function bytesFromBase64(dataBase64) {
+      const binary = atob(dataBase64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i += 1) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+      return bytes;
+    }
+
+    function quoteFontFamily(fontFamily) {
+      return `"${fontFamily.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+    }
+
+    function appendFontOption(value, label) {
+      const option = document.createElement('option');
+      option.value = value;
+      option.textContent = label;
+      terminalFontSelect.appendChild(option);
+    }
+
+    function populateFontSelect(fontFamilies) {
+      systemFontFamilies = Array.from(new Set((fontFamilies || [])
+        .map(fontFamily => String(fontFamily).trim())
+        .filter(Boolean)));
+      systemFontFamilies.sort((left, right) => left.localeCompare(right, undefined, { sensitivity: 'base' }));
+
+      terminalFontSelect.replaceChildren();
+      appendFontOption(defaultTerminalFont, '默认');
+      for (const fontFamily of systemFontFamilies) {
+        appendFontOption(quoteFontFamily(fontFamily), fontFamily);
+      }
+      if (!systemFontFamilies.some(fontFamily => fontFamily.toLowerCase() === 'monospace')) {
+        appendFontOption('monospace', 'monospace');
+      }
+      syncFontSelect();
+    }
+
+    function syncFontSelect() {
+      if (!Array.from(terminalFontSelect.options).some(option => option.value === terminalSettings.fontFamily)) {
+        const option = document.createElement('option');
+        option.value = terminalSettings.fontFamily;
+        option.textContent = '已保存字体';
+        terminalFontSelect.appendChild(option);
+      }
+      terminalFontSelect.value = terminalSettings.fontFamily;
+    }
+
+    function normalizeFontSize(value) {
+      const parsed = Number.parseInt(value, 10);
+      if (Number.isNaN(parsed)) {
+        return defaultTerminalFontSize;
+      }
+      return Math.min(maxTerminalFontSize, Math.max(minTerminalFontSize, parsed));
+    }
+
+    function syncSettingsControls() {
+      syncFontSelect();
+      terminalFontSizeInput.value = String(terminalSettings.fontSize);
+    }
+
+    function syncTerminalFontCss() {
+      document.documentElement.style.setProperty('--terminal-font-family', terminalSettings.fontFamily);
+    }
+
+    function applyFontToTerminalElement(element) {
+      element.style.setProperty('font-family', terminalSettings.fontFamily, 'important');
+      for (const node of element.querySelectorAll('.xterm, .xterm-screen, .xterm-rows, .xterm-rows > div, textarea')) {
+        node.style.setProperty('font-family', terminalSettings.fontFamily, 'important');
+      }
+    }
+
+    function setTerminalFontOption(term) {
+      try {
+        term.options.fontFamily = terminalSettings.fontFamily;
+        term.options.fontSize = terminalSettings.fontSize;
+      } catch (error) {}
+      if (typeof term.setOption === 'function') {
+        try {
+          term.setOption('fontFamily', terminalSettings.fontFamily);
+          term.setOption('fontSize', terminalSettings.fontSize);
+        } catch (error) {}
+      }
+      if (typeof term.clearTextureAtlas === 'function') {
+        try {
+          term.clearTextureAtlas();
+        } catch (error) {}
+      }
+      if (typeof term.refresh === 'function' && term.rows > 0) {
+        term.refresh(0, term.rows - 1);
+      }
+    }
+
+    function setSettingsOpen(open) {
+      settingsPanel.hidden = !open;
+      if (open) {
+        syncSettingsControls();
+        terminalFontSelect.focus();
+      }
+    }
+
+    function persistSettings() {
+      post({
+        type: 'updateSettings',
+        fontFamily: terminalSettings.fontFamily,
+        fontSize: terminalSettings.fontSize,
+      });
+    }
+
+    function applyTerminalAppearance({ fontFamily = terminalSettings.fontFamily, fontSize = terminalSettings.fontSize } = {}) {
+      terminalSettings.fontFamily = String(fontFamily).trim() || defaultTerminalFont;
+      terminalSettings.fontSize = normalizeFontSize(fontSize);
+      syncTerminalFontCss();
+      syncSettingsControls();
+      for (const pane of panes.values()) {
+        pane.updateFont();
+      }
+      persistSettings();
+      requestAnimationFrame(fitVisiblePanes);
+    }
+
+    function setUpdateStatus(message, kind = '') {
+      updateStatus.textContent = message || '';
+      updateStatus.className = `update-status${kind ? ` ${kind}` : ''}`;
+    }
+
+    function setUpdateButton(mode, { disabled = false } = {}) {
+      updateButtonMode = mode;
+      checkUpdateButton.disabled = disabled;
+      checkUpdateButton.textContent = mode === 'install' ? '立即更新' : '检查更新';
+      if (mode === 'checking') {
+        checkUpdateButton.textContent = '检查中...';
+      } else if (mode === 'installing') {
+        checkUpdateButton.textContent = '更新中...';
+      } else if (mode === 'launched') {
+        checkUpdateButton.textContent = '已启动安装';
+      }
+    }
+
+    function checkForUpdates(manual) {
+      if (updateCheckInFlight || updateInstallInFlight) {
+        return;
+      }
+      updateCheckInFlight = true;
+      latestUpdate = null;
+      setUpdateButton('checking', { disabled: true });
+      setUpdateStatus(manual ? '正在检查更新...' : '正在自动检查更新...');
+      post({ type: 'checkForUpdates', manual: Boolean(manual) });
+    }
+
+    function installLatestUpdate(silent) {
+      if (updateInstallInFlight) {
+        return;
+      }
+      if (!latestUpdate || !latestUpdate.assetUrl) {
+        setUpdateStatus('没有可下载安装的更新包。', 'warning');
+        setUpdateButton('check');
+        return;
+      }
+      updateInstallInFlight = true;
+      setUpdateButton('installing', { disabled: true });
+      setUpdateStatus(silent ? `正在自动下载 ${latestUpdate.version}...` : `正在下载 ${latestUpdate.version}...`);
+      post({
+        type: 'installUpdate',
+        version: latestUpdate.version,
+        assetUrl: latestUpdate.assetUrl,
+        silent: Boolean(silent),
+      });
+    }
+
+    function handleUpdateButtonClick() {
+      if (updateButtonMode === 'install' && latestUpdate && latestUpdate.assetUrl) {
+        installLatestUpdate(false);
+        return;
+      }
+      checkForUpdates(true);
+    }
+
+    function copyPaneSelection(pane) {
+      if (!pane) {
+        return false;
+      }
+      post({ type: 'copyToClipboard', text: pane.currentSelection() });
+      return true;
+    }
+
+    function pasteIntoPane(pane) {
+      if (!pane) {
+        return false;
+      }
+      post({ type: 'pasteFromClipboard', paneId: pane.id });
+      return true;
+    }
+
+    function stopKeyboardShortcut(event) {
+      event.preventDefault();
+      event.stopPropagation();
+      if (typeof event.stopImmediatePropagation === 'function') {
+        event.stopImmediatePropagation();
+      }
+    }
+
+    function shortcutKeyMatches(event, key) {
+      return event.key.toLowerCase() === key || event.code === `Key${key.toUpperCase()}`;
+    }
+
+    function paneFromEventTarget(target) {
+      const paneElement = target && target.closest ? target.closest('.pane') : null;
+      if (!paneElement) {
+        return activePane();
+      }
+      return panes.get(Number(paneElement.dataset.paneId)) || activePane();
+    }
+
+    function handleTerminalClipboardShortcut(event, pane) {
+      if (event.type !== 'keydown' || !event.ctrlKey || !event.shiftKey || event.altKey) {
+        return true;
+      }
+      if (settingsPanel.contains(event.target)) {
+        return true;
+      }
+      if (shortcutKeyMatches(event, 'c')) {
+        stopKeyboardShortcut(event);
+        copyPaneSelection(pane || paneFromEventTarget(event.target));
+        return false;
+      }
+      if (shortcutKeyMatches(event, 'v')) {
+        stopKeyboardShortcut(event);
+        pasteIntoPane(pane || paneFromEventTarget(event.target));
+        return false;
+      }
+      return true;
+    }
+
+    function makePaneButton(className, title, text, onClick) {
+      const button = document.createElement('button');
+      button.className = className;
+      button.title = title;
+      button.innerHTML = text;
+      button.addEventListener('pointerdown', event => {
+        event.preventDefault();
+        event.stopPropagation();
+      }, true);
+      button.addEventListener('click', event => {
+        event.preventDefault();
+        event.stopPropagation();
+        onClick();
+      });
+      return button;
+    }
+
+    class PaneView {
+      constructor(event, tab) {
+        this.id = event.paneId;
+        this.tabId = event.tabId;
+        this.tab = tab;
+        this.started = false;
+        this.starting = false;
+        this.opened = false;
+        this.deferredFitTimer = null;
+        this.exited = Boolean(event.exited);
+        this.selection = '';
+
+        this.element = document.createElement('section');
+        this.element.className = 'pane';
+        this.element.dataset.paneId = String(this.id);
+
+        this.headerElement = document.createElement('div');
+        this.headerElement.className = 'pane-header';
+
+        this.cwdElement = document.createElement('span');
+        this.cwdElement.className = 'pane-cwd';
+        this.cwdElement.textContent = event.cwd || '~';
+
+        this.addButton = makePaneButton('pane-action add', '新增 Pane', '+', () => {
+          const activeTab = tabs.get(activeTabId);
+          if (!activeTab || activeTab.panes.length < maxPanesPerTab) {
+            post({ type: 'addPane' });
+          }
+        });
+        this.closeButton = makePaneButton('pane-action close', '关闭', '&#10005;', () => {
+          post({ type: 'closePane', paneId: this.id });
+        });
+
+        this.headerElement.append(this.cwdElement, this.addButton, this.closeButton);
+
+        this.terminalElement = document.createElement('div');
+        this.terminalElement.className = 'terminal';
+        applyFontToTerminalElement(this.terminalElement);
+        this.element.append(this.headerElement, this.terminalElement);
+
+        this.term = new window.Terminal(makeTerminalOptions());
+        this.fitAddon = new window.FitAddon.FitAddon();
+        this.term.loadAddon(this.fitAddon);
+        if (window.ClipboardAddon && typeof window.ClipboardAddon.ClipboardAddon === 'function') {
+          this.clipboardAddon = new window.ClipboardAddon.ClipboardAddon(undefined, {
+            readText: () => navigator.clipboard ? navigator.clipboard.readText() : Promise.resolve(''),
+            writeText: (_selection, data) => {
+              post({ type: 'copyToClipboard', text: data || this.currentSelection() });
+              return navigator.clipboard ? navigator.clipboard.writeText(data || this.currentSelection()).catch(() => {}) : Promise.resolve();
+            },
+          });
+          this.term.loadAddon(this.clipboardAddon);
+        }
+        this.term.onData(data => post({ type: 'input', paneId: this.id, data }));
+        if (typeof this.term.onSelectionChange === 'function') {
+          this.term.onSelectionChange(() => this.syncSelection());
+        }
+        this.term.attachCustomKeyEventHandler(event => handleTerminalClipboardShortcut(event, this));
+
+        this.terminalElement.addEventListener('mousedown', () => this.focus(true));
+        this.resizeObserver = new ResizeObserver(() => {
+          this.fit();
+          this.ensureStarted();
+        });
+        this.resizeObserver.observe(this.terminalElement);
+      }
+
+      attach() {
+        this.tab.content.appendChild(this.element);
+        this.openTerminal();
+        this.flushPendingOutput();
+        this.scheduleFitAndStart();
+      }
+
+      openTerminal() {
+        if (this.opened) {
+          return;
+        }
+        this.term.open(this.terminalElement);
+        this.opened = true;
+        applyFontToTerminalElement(this.terminalElement);
+      }
+
+      scheduleFitAndStart() {
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => {
+            this.fit();
+            this.ensureStarted();
+          });
+        });
+        if (this.deferredFitTimer !== null) {
+          clearTimeout(this.deferredFitTimer);
+        }
+        this.deferredFitTimer = setTimeout(() => {
+          this.deferredFitTimer = null;
+          this.fit();
+          this.ensureStarted();
+        }, 80);
+      }
+
+      fit() {
+        if (!this.opened || !this.element.isConnected || this.element.offsetParent === null) {
+          return null;
+        }
+        const rect = this.terminalElement.getBoundingClientRect();
+        if (rect.width < 20 || rect.height < 20) {
+          return null;
+        }
+        try {
+          this.fitAddon.fit();
+          const cols = Math.max(1, this.term.cols || fallbackCols);
+          const rows = Math.max(1, this.term.rows || fallbackRows);
+          if (this.started) {
+            post({ type: 'resize', paneId: this.id, cols, rows });
+          }
+          return { cols, rows };
+        } catch (error) {
+          setStatus(String(error));
+          return null;
+        }
+      }
+
+      ensureStarted() {
+        if (this.exited || this.started || this.starting) {
+          return;
+        }
+        const size = this.fit();
+        if (!size) {
+          return;
+        }
+        this.starting = true;
+        this.started = true;
+        post({ type: 'startPane', paneId: this.id, cols: size.cols, rows: size.rows });
+      }
+
+      setActive(active) {
+        this.element.classList.toggle('active', active);
+      }
+
+      currentSelection() {
+        const selection = this.term.getSelection();
+        return selection || this.selection;
+      }
+
+      syncSelection() {
+        this.selection = this.term.getSelection();
+        post({ type: 'selectionChanged', paneId: this.id, text: this.selection });
+      }
+
+      syncControls(paneCount) {
+        const closeHidden = paneCount <= 1;
+        const addHidden = paneCount >= maxPanesPerTab;
+        this.closeButton.hidden = closeHidden;
+        this.addButton.hidden = addHidden;
+        this.closeButton.style.display = closeHidden ? 'none' : '';
+        this.addButton.style.display = addHidden ? 'none' : '';
+      }
+
+      focus(notify) {
+        activePaneId = this.id;
+        for (const pane of panes.values()) {
+          const tab = tabs.get(pane.tabId);
+          const canShowActive = tab && tab.panes.length > 1;
+          pane.setActive(canShowActive && pane.id === this.id);
+        }
+        this.scheduleFitAndStart();
+        requestAnimationFrame(() => this.term.focus());
+        if (notify) {
+          post({ type: 'selectPane', paneId: this.id });
+        }
+      }
+
+      reset(event) {
+        pendingOutput.delete(this.id);
+        this.started = false;
+        this.starting = false;
+        this.exited = false;
+        this.selection = '';
+        this.cwdElement.textContent = event.cwd || '~';
+        post({ type: 'selectionChanged', paneId: this.id, text: '' });
+        this.term.reset();
+        this.term.clear();
+        this.scheduleFitAndStart();
+      }
+
+      write(dataBase64) {
+        if (!this.opened) {
+          const chunks = pendingOutput.get(this.id) || [];
+          chunks.push(dataBase64);
+          pendingOutput.set(this.id, chunks);
+          return;
+        }
+        this.term.write(bytesFromBase64(dataBase64));
+      }
+
+      flushPendingOutput() {
+        const chunks = pendingOutput.get(this.id);
+        if (!chunks) {
+          return;
+        }
+        pendingOutput.delete(this.id);
+        for (const chunk of chunks) {
+          this.write(chunk);
+        }
+      }
+
+      markExited() {
+        this.started = false;
+        this.starting = false;
+        this.exited = true;
+        this.cwdElement.textContent = 'exited';
+      }
+
+      updateFont() {
+        applyFontToTerminalElement(this.terminalElement);
+        setTerminalFontOption(this.term);
+        requestAnimationFrame(() => {
+          applyFontToTerminalElement(this.terminalElement);
+          this.fit();
+        });
+      }
+
+      dispose() {
+        if (this.deferredFitTimer !== null) {
+          clearTimeout(this.deferredFitTimer);
+          this.deferredFitTimer = null;
+        }
+        pendingOutput.delete(this.id);
+        this.resizeObserver.disconnect();
+        this.term.dispose();
+        this.element.remove();
+      }
+    }
+
+    function syncTabCloseButtons() {
+      const closable = tabs.size > 1;
+      for (const tab of tabs.values()) {
+        tab.close.hidden = !closable;
+        tab.close.style.display = closable ? '' : 'none';
+      }
+    }
+
+    function createTab(event) {
+      if (tabs.has(event.tabId)) {
+        return;
+      }
+
+      const tabId = event.tabId;
+      const button = document.createElement('button');
+      const title = document.createElement('span');
+      title.className = 'tab-title';
+      title.textContent = event.title;
+      const close = document.createElement('span');
+      close.className = 'tab-close';
+      close.textContent = '×';
+      close.title = '关闭标签页';
+      close.addEventListener('pointerdown', event => {
+        event.preventDefault();
+        event.stopPropagation();
+      }, true);
+      close.addEventListener('click', event => {
+        event.preventDefault();
+        event.stopPropagation();
+        post({ type: 'closeTab', tabId });
+      });
+      button.append(title, close);
+      button.addEventListener('click', () => post({ type: 'selectTab', tabId }));
+      tabBar.appendChild(button);
+
+      const content = document.createElement('div');
+      content.className = 'tab-content';
+      workspace.appendChild(content);
+
+      tabs.set(event.tabId, {
+        id: event.tabId,
+        title: event.title,
+        button,
+        close,
+        content,
+        panes: [],
+      });
+      syncTabCloseButtons();
+    }
+
+    function paneLayoutSlot(count, index) {
+      if (count <= 3) {
+        return { column: index + 1, row: 1, rowSpan: 1 };
+      }
+      const slots = [
+        { column: 1, row: 1, rowSpan: 1 },
+        { column: 2, row: 1, rowSpan: count === 4 ? 2 : 1 },
+        { column: 3, row: 1, rowSpan: count <= 5 ? 2 : 1 },
+        { column: 1, row: 2, rowSpan: 1 },
+        { column: 2, row: 2, rowSpan: 1 },
+        { column: 3, row: 2, rowSpan: 1 },
+      ];
+      return slots[index];
+    }
+
+    function layoutTab(tab) {
+      const views = tab.panes.map(id => panes.get(id)).filter(Boolean);
+      const count = views.length;
+      const columns = count <= 3 ? Math.max(1, count) : 3;
+      const rows = count <= 3 ? 1 : 2;
+
+      tab.content.style.gap = '0';
+      tab.content.style.gridTemplateColumns = `repeat(${columns}, minmax(0, 1fr))`;
+      tab.content.style.gridTemplateRows = `repeat(${rows}, minmax(0, 1fr))`;
+
+      views.forEach((pane, index) => {
+        const slot = paneLayoutSlot(count, index);
+        pane.element.style.gridColumn = `${slot.column} / span 1`;
+        pane.element.style.gridRow = `${slot.row} / span ${slot.rowSpan}`;
+        pane.setActive(count > 1 && pane.id === activePaneId);
+        pane.syncControls(count);
+      });
+
+      requestAnimationFrame(() => {
+        for (const pane of views) {
+          pane.scheduleFitAndStart();
+        }
+      });
+    }
+
+    function fitVisiblePanes() {
+      const tab = tabs.get(activeTabId);
+      if (!tab) {
+        return;
+      }
+      for (const paneId of tab.panes) {
+        const pane = panes.get(paneId);
+        if (pane) {
+          pane.fit();
+          pane.ensureStarted();
+        }
+      }
+    }
+
+    function selectTab(tabId) {
+      const tab = tabs.get(tabId);
+      if (!tab) {
+        return;
+      }
+      activeTabId = tabId;
+      for (const existing of tabs.values()) {
+        const active = existing.id === tabId;
+        existing.button.classList.toggle('active', active);
+        existing.content.classList.toggle('active', active);
+      }
+      layoutTab(tab);
+    }
+
+    function createPane(event) {
+      const tab = tabs.get(event.tabId);
+      if (!tab || panes.has(event.paneId)) {
+        return;
+      }
+      const pane = new PaneView(event, tab);
+      panes.set(pane.id, pane);
+      tab.panes.push(pane.id);
+      pane.attach();
+      layoutTab(tab);
+      if (event.active) {
+        selectPane(pane.id);
+      }
+    }
+
+    function selectPane(paneId) {
+      const pane = panes.get(paneId);
+      if (!pane) {
+        return;
+      }
+      selectTab(pane.tabId);
+      pane.focus(false);
+    }
+
+    function resetPane(event) {
+      const pane = panes.get(event.paneId);
+      if (pane) {
+        pane.reset(event);
+      }
+    }
+
+    function closePane(paneId) {
+      const pane = panes.get(paneId);
+      if (!pane) {
+        return;
+      }
+      const tab = tabs.get(pane.tabId);
+      pane.dispose();
+      panes.delete(paneId);
+      if (tab) {
+        tab.panes = tab.panes.filter(id => id !== paneId);
+        layoutTab(tab);
+      }
+      if (activePaneId === paneId) {
+        activePaneId = null;
+      }
+    }
+
+    function closeTab(tabId) {
+      const tab = tabs.get(tabId);
+      if (!tab) {
+        return;
+      }
+      for (const paneId of [...tab.panes]) {
+        const pane = panes.get(paneId);
+        if (pane) {
+          pane.dispose();
+          panes.delete(paneId);
+        }
+      }
+      tab.button.remove();
+      tab.content.remove();
+      tabs.delete(tabId);
+      if (activeTabId === tabId) {
+        activeTabId = null;
+      }
+      syncTabCloseButtons();
+    }
+
+    function writePane(event) {
+      const pane = panes.get(event.paneId);
+      if (!pane) {
+        const chunks = pendingOutput.get(event.paneId) || [];
+        chunks.push(event.dataBase64);
+        pendingOutput.set(event.paneId, chunks);
+        return;
+      }
+      pane.write(event.dataBase64);
+    }
+
+    function markExited(event) {
+      const pane = panes.get(event.paneId);
+      if (pane) {
+        pane.markExited();
+      }
+    }
+
+    function copySelection() {
+      copyPaneSelection(activePane());
+    }
+
+    function pasteClipboard() {
+      pasteIntoPane(activePane());
+    }
+
+    function isTitlebarInteractive(target) {
+      return Boolean(target.closest('button, #newTabButton, #tabBar, #windowControls'));
+    }
+
+    function bindUi() {
+      syncSettingsControls();
+      settingsButton.addEventListener('click', event => {
+        event.stopPropagation();
+        setSettingsOpen(settingsPanel.hidden);
+      });
+      terminalFontSelect.addEventListener('change', () => {
+        applyTerminalAppearance({ fontFamily: terminalFontSelect.value });
+      });
+      terminalFontSizeInput.addEventListener('change', () => {
+        applyTerminalAppearance({ fontSize: terminalFontSizeInput.value });
+      });
+      resetFontButton.addEventListener('click', () => {
+        applyTerminalAppearance({
+          fontFamily: defaultTerminalFont,
+          fontSize: defaultTerminalFontSize,
+        });
+      });
+      checkUpdateButton.addEventListener('click', handleUpdateButtonClick);
+      for (const input of [terminalFontSelect, terminalFontSizeInput]) {
+        input.addEventListener('keydown', event => {
+          if (event.key === 'Escape') {
+            setSettingsOpen(false);
+          }
+        });
+      }
+      document.addEventListener('pointerdown', event => {
+        if (!settingsPanel.hidden && !settingsPanel.contains(event.target) && event.target !== settingsButton) {
+          setSettingsOpen(false);
+        }
+      });
+      document.getElementById('windowMinimize').addEventListener('click', () => post({ type: 'minimizeWindow' }));
+      document.getElementById('windowMaximize').addEventListener('click', () => post({ type: 'toggleMaximizeWindow' }));
+      document.getElementById('windowClose').addEventListener('click', () => post({ type: 'closeWindow' }));
+      titleBar.addEventListener('pointerdown', event => {
+        if (event.button !== 0 || event.detail > 1 || isTitlebarInteractive(event.target)) {
+          return;
+        }
+        post({ type: 'dragWindow' });
+      });
+      titleBar.addEventListener('dblclick', event => {
+        if (!isTitlebarInteractive(event.target)) {
+          post({ type: 'toggleMaximizeWindow' });
+        }
+      });
+      let lastNewTabRequest = 0;
+      const requestNewTab = event => {
+        event.preventDefault();
+        event.stopPropagation();
+        const now = Date.now();
+        if (now - lastNewTabRequest < 250) {
+          return;
+        }
+        lastNewTabRequest = now;
+        post({ type: 'newTab' });
+      };
+      newTabButton.addEventListener('pointerdown', requestNewTab, true);
+      newTabButton.addEventListener('mousedown', requestNewTab, true);
+      newTabButton.addEventListener('click', requestNewTab, true);
+      newTabButton.addEventListener('keydown', event => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          requestNewTab(event);
+        }
+      }, true);
+      document.addEventListener('keydown', event => {
+        handleTerminalClipboardShortcut(event, paneFromEventTarget(event.target));
+      }, true);
+    }
+
+    window.vibeTerm = {
+      receive(event) {
+        switch (event.type) {
+          case 'init':
+            maxPanesPerTab = event.maxPanesPerTab;
+            appVersion = event.appVersion || '';
+            appVersionText.textContent = appVersion || '-';
+            terminalSettings.fontFamily = event.fontFamily || defaultTerminalFont;
+            terminalSettings.fontSize = normalizeFontSize(event.fontSize || defaultTerminalFontSize);
+            syncTerminalFontCss();
+            populateFontSelect(event.fontFamilies);
+            syncSettingsControls();
+            for (const pane of panes.values()) {
+              pane.updateFont();
+            }
+            setStatus('');
+            break;
+          case 'tabCreated':
+            createTab(event);
+            break;
+          case 'tabSelected':
+            selectTab(event.tabId);
+            break;
+          case 'tabClosed':
+            closeTab(event.tabId);
+            break;
+          case 'paneCreated':
+            createPane(event);
+            break;
+          case 'paneSelected':
+            selectPane(event.paneId);
+            break;
+          case 'paneReset':
+            resetPane(event);
+            break;
+          case 'paneClosed':
+            closePane(event.paneId);
+            break;
+          case 'output':
+            writePane(event);
+            break;
+          case 'updateCheckStarted':
+            updateCheckInFlight = true;
+            setUpdateButton('checking', { disabled: true });
+            setUpdateStatus(event.manual ? '正在检查更新...' : '正在自动检查更新...');
+            break;
+          case 'updateAvailable':
+            updateCheckInFlight = false;
+            latestUpdate = event;
+            if (event.assetUrl) {
+              setUpdateButton('install');
+              setUpdateStatus(`发现新版本 ${event.version}，点击“立即更新”开始安装。`, 'success');
+            } else {
+              setUpdateButton('check');
+              setUpdateStatus(`发现新版本 ${event.version}，但没有可自动安装的安装包。`, 'warning');
+            }
+            break;
+          case 'updateNotAvailable':
+            updateCheckInFlight = false;
+            latestUpdate = null;
+            setUpdateButton('check');
+            setUpdateStatus(`已是最新版本 ${event.currentVersion}。`, 'success');
+            break;
+          case 'updateInstallStarted':
+            updateInstallInFlight = true;
+            setUpdateButton('installing', { disabled: true });
+            setUpdateStatus(`正在下载 ${event.version}...`);
+            break;
+          case 'updateInstallLaunched':
+            updateInstallInFlight = false;
+            setUpdateButton('launched', { disabled: true });
+            setUpdateStatus(`安装程序已启动：${event.version}`, 'success');
+            break;
+          case 'updateError':
+            updateCheckInFlight = false;
+            updateInstallInFlight = false;
+            setUpdateButton(latestUpdate && latestUpdate.assetUrl ? 'install' : 'check');
+            setUpdateStatus(event.message || '更新失败。', 'error');
+            break;
+          case 'exit':
+            markExited(event);
+            break;
+          case 'status':
+            setStatus(event.message);
+            break;
+          case 'error':
+            setStatus(event.message);
+            break;
+        }
+      },
+      fitActive() {
+        fitVisiblePanes();
+      },
+    };
+
+    window.addEventListener('resize', () => requestAnimationFrame(fitVisiblePanes));
+
+    function boot() {
+      const missingXtermGlobals = [];
+      if (typeof window.Terminal !== 'function') missingXtermGlobals.push('Terminal');
+      if (!window.FitAddon || typeof window.FitAddon.FitAddon !== 'function') missingXtermGlobals.push('FitAddon');
+      if (!window.ClipboardAddon || typeof window.ClipboardAddon.ClipboardAddon !== 'function') missingXtermGlobals.push('ClipboardAddon');
+      if (missingXtermGlobals.length) {
+        setStatus(`xterm.js 加载失败：缺少 ${missingXtermGlobals.join(', ')}`);
+        return;
+      }
+      bindUi();
+      post({ type: 'ready' });
+    }
+
+    if (document.readyState === 'loading') {
+      window.addEventListener('DOMContentLoaded', boot);
     } else {
-        // Port already bound, but we're starting as main anyway (fallback)
-        // Create a dummy receiver that never receives anything
-        let (sender, receiver) = unbounded();
-        // Drop sender so receiver never gets anything
-        std::mem::forget(sender);
-        receiver
-    };
-    
-    let app_icon = load_app_icon()?;
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1200.0, 800.0])
-            .with_title("VibeTerm")
-            .with_icon(app_icon)
-            .with_decorations(false),
-        ..Default::default()
-    };
-    
-    eframe::run_native(
-        "VibeTerm",
-        options,
-        Box::new(|cc| Ok(Box::new(App::new(cc, ipc_receiver)?))),
-    )
-    .map_err(|e| anyhow::anyhow!("Failed to run application: {:?}", e))
+      boot();
+    }
+  </script>
+</body>
+</html>"##;
+
+    let xterm_js = browser_global_script(XTERM_JS);
+    let addon_fit_js = browser_global_script(XTERM_ADDON_FIT_JS);
+    let addon_clipboard_js = browser_global_script(XTERM_ADDON_CLIPBOARD_JS);
+
+    html.replace("__XTERM_CSS__", XTERM_CSS)
+        .replace("__XTERM_JS__", &xterm_js)
+        .replace("__XTERM_ADDON_FIT_JS__", &addon_fit_js)
+        .replace("__XTERM_ADDON_CLIPBOARD_JS__", &addon_clipboard_js)
 }
