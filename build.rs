@@ -1,23 +1,35 @@
+use std::{fs, path::Path};
+
 fn main() {
+    println!("cargo:rerun-if-changed=tauri.conf.json");
+    println!("cargo:rerun-if-changed=capabilities/default.json");
+    println!("cargo:rerun-if-changed=ui/index.html");
+    println!("cargo:rerun-if-changed=assets/xterm");
     println!("cargo:rerun-if-changed=assets/icon.ico");
     println!("cargo:rerun-if-changed=assets/icon.png");
     println!("cargo:rerun-if-changed=assets/icon.svg");
 
-    #[cfg(target_os = "windows")]
-    {
-        let mut res = winres::WindowsResource::new();
-        res.set_icon("assets/icon.ico");
-        res.set_manifest(
-            r#"
-<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0" xmlns:asmv3="urn:schemas-microsoft-com:asm.v3">
-  <asmv3:application>
-    <asmv3:windowsSettings>
-      <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
-    </asmv3:windowsSettings>
-  </asmv3:application>
-</assembly>
-"#,
-        );
-        res.compile().expect("failed to compile Windows resources");
+    copy_xterm_assets();
+    tauri_build::build()
+}
+
+fn copy_xterm_assets() {
+    let source_dir = Path::new("assets").join("xterm");
+    let target_dir = Path::new("ui").join("vendor").join("xterm");
+
+    if target_dir.exists() {
+        fs::remove_dir_all(&target_dir).expect("failed to clear ui/vendor/xterm");
+    }
+    fs::create_dir_all(&target_dir).expect("failed to create ui/vendor/xterm");
+
+    for entry in fs::read_dir(&source_dir).expect("failed to read assets/xterm") {
+        let entry = entry.expect("failed to read xterm entry");
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+
+        println!("cargo:rerun-if-changed={}", path.display());
+        fs::copy(&path, target_dir.join(entry.file_name())).expect("failed to copy xterm asset");
     }
 }

@@ -2,4 +2,6 @@
 /.omc
 /.idea
 /dist
+/gen
 /installer/Output
+/ui/vendor

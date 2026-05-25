@@ -1,0 +1,2441 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self' tauri: asset: data: blob:; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; font-src 'self' asset: data:; img-src 'self' asset: data: blob:; connect-src 'self' tauri: asset:">
+  <title>VibeTerm</title>
+  <link id="xtermCss" rel="stylesheet" href="./vendor/xterm/xterm.css">
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0f1219;
+      --panel: #171b25;
+      --panel-strong: #202636;
+      --border: #2d3447;
+      --text: #dcdfe4;
+      --muted: #8f98ad;
+      --accent: #c678dd;
+      --accent-2: #61afef;
+      --terminal-font-family: Cascadia Mono, Cascadia Code, Consolas, monospace;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html, body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+    }
+
+    #app {
+      width: 100%;
+      height: 100%;
+      min-width: 0;
+      min-height: 0;
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      position: relative;
+      background: var(--bg);
+      color: var(--text);
+      font-family: "Segoe UI", system-ui, sans-serif;
+    }
+
+    #titleBar {
+      height: 36px;
+      display: flex;
+      align-items: stretch;
+      border-bottom: 1px solid var(--border);
+      background: var(--panel);
+      user-select: none;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      padding: 0 12px;
+      color: var(--accent);
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+    }
+
+    #tabBar {
+      display: flex;
+      align-items: stretch;
+      gap: 0;
+      min-width: 0;
+      max-width: 62vw;
+      overflow: hidden;
+    }
+
+    #tabBar button {
+      height: 36px;
+      min-width: 96px;
+      max-width: 160px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      border: 0;
+      border-radius: 0;
+      background: transparent;
+      color: var(--muted);
+      padding: 0 8px 0 12px;
+      overflow: hidden;
+      white-space: nowrap;
+    }
+
+    #tabBar button:hover {
+      background: rgba(255, 255, 255, 0.04);
+      color: var(--text);
+    }
+
+    #tabBar button.active {
+      position: relative;
+      z-index: 2;
+      margin-bottom: -1px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-bottom: 0;
+      border-radius: 6px 6px 0 0;
+      color: white;
+      box-shadow: inset 0 2px 0 var(--accent), 0 1px 0 var(--bg);
+    }
+
+    .tab-title {
+      flex: 1;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .tab-close {
+      width: 18px;
+      height: 18px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 4px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1;
+      flex: 0 0 auto;
+    }
+
+    .tab-close[hidden],
+    .pane-action[hidden] {
+      display: none !important;
+    }
+
+    .tab-close:hover {
+      background: rgba(255, 255, 255, 0.12);
+      color: var(--text);
+    }
+
+    #newTabButton {
+      width: 36px;
+      height: 36px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border: 0;
+      border-radius: 0;
+      background: transparent;
+      color: var(--muted);
+      font-size: 18px;
+      line-height: 1;
+      cursor: pointer;
+    }
+
+    #newTabButton:hover {
+      background: rgba(255, 255, 255, 0.04);
+      color: var(--text);
+    }
+
+    .titlebar-drag {
+      flex: 1;
+      min-width: 40px;
+    }
+
+    #windowControls {
+      display: flex;
+      margin-left: auto;
+    }
+
+    .window-control {
+      width: 46px;
+      height: 35px;
+      border: 0;
+      border-radius: 0;
+      background: transparent;
+      color: var(--text);
+      padding: 0;
+      font-family: "Segoe MDL2 Assets", "Segoe UI Symbol", sans-serif;
+      font-size: 10px;
+    }
+
+    .window-control:hover {
+      background: rgba(255, 255, 255, 0.1);
+    }
+
+    .window-control.close:hover {
+      background: #c42b1c;
+      color: white;
+    }
+
+    #titleBar #newTabButton {
+      min-width: 36px;
+      border: 0;
+      border-radius: 0;
+      background: transparent;
+      padding: 0;
+    }
+
+    #windowControls .window-control {
+      border: 0;
+      border-radius: 0;
+      background: transparent;
+      padding: 0;
+    }
+
+    #windowControls .window-control:hover {
+      background: rgba(255, 255, 255, 0.1);
+      border-color: transparent;
+    }
+
+    #windowControls .window-control.close:hover {
+      background: #c42b1c;
+      color: white;
+    }
+
+    #settingsPanel {
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      z-index: 10;
+      width: min(420px, calc(100vw - 48px));
+      padding: 16px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: var(--panel);
+      box-shadow: 0 16px 40px rgba(0, 0, 0, 0.35);
+      color: var(--text);
+    }
+
+    #settingsPanel[hidden] {
+      display: none;
+    }
+
+    .settings-title {
+      margin-bottom: 14px;
+      font-size: 15px;
+      font-weight: 600;
+    }
+
+    .settings-content {
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+
+    .settings-column {
+      min-width: 0;
+    }
+
+    .settings-column + .settings-column {
+      padding-top: 14px;
+      border-top: 1px solid var(--border);
+    }
+
+    .settings-row {
+      display: grid;
+      grid-template-columns: 56px minmax(0, 1fr);
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 12px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .settings-row select,
+    .settings-row input[type="number"] {
+      width: 100%;
+      height: 32px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: #0b0e14;
+      color: var(--text);
+      padding: 0 10px;
+      font: inherit;
+    }
+
+    .settings-row select:focus,
+    .settings-row input[type="number"]:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+
+    .settings-section {
+      margin: 0;
+    }
+
+    .settings-section-title {
+      margin-bottom: 10px;
+      color: var(--text);
+      font-size: 13px;
+      font-weight: 600;
+    }
+
+    .settings-version,
+    .update-status {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.5;
+    }
+
+    .settings-version {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 12px;
+      padding: 10px;
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.025);
+    }
+
+    #appVersionText {
+      color: var(--text);
+      font-weight: 600;
+    }
+
+    .update-status {
+      min-height: 18px;
+      margin: 10px 0 12px;
+    }
+
+    .update-status.success {
+      color: #98c379;
+    }
+
+    .update-status.warning {
+      color: #e5c07b;
+    }
+
+    .update-status.error {
+      color: #e06c75;
+    }
+
+    .settings-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+    }
+
+    .settings-primary-action {
+      width: 100%;
+      height: 34px;
+      border: 1px solid rgba(198, 120, 221, 0.65);
+      border-radius: 8px;
+      background: rgba(198, 120, 221, 0.14);
+      color: #f1d6ff;
+      font-weight: 600;
+    }
+
+    .settings-primary-action:hover:not(:disabled) {
+      background: rgba(198, 120, 221, 0.22);
+    }
+
+    .settings-primary-action:disabled {
+      cursor: default;
+      opacity: 0.65;
+    }
+
+    #statusBar {
+      position: absolute;
+      right: 10px;
+      bottom: 10px;
+      z-index: 20;
+      max-width: min(520px, calc(100% - 20px));
+      min-height: 26px;
+      display: flex;
+      align-items: center;
+      padding: 0 10px;
+      background: rgba(23, 27, 37, 0.94);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--muted);
+      font-size: 12px;
+      pointer-events: none;
+      user-select: none;
+    }
+
+    #statusBar[hidden] {
+      display: none;
+    }
+
+    button {
+      border: 1px solid var(--border);
+      background: var(--panel-strong);
+      color: var(--text);
+      border-radius: 8px;
+      padding: 6px 10px;
+      font: inherit;
+      cursor: pointer;
+    }
+
+    button:hover {
+      border-color: var(--accent-2);
+    }
+
+    #workspace {
+      flex: 1 1 0;
+      min-height: 0;
+      padding: 0;
+      background: var(--bg);
+      overflow: hidden;
+    }
+
+    .tab-content {
+      display: none;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+    }
+
+    .tab-content.active {
+      display: grid;
+      align-items: stretch;
+      justify-items: stretch;
+    }
+
+    .pane {
+      width: 100%;
+      height: 100%;
+      min-width: 0;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      border: 1px solid var(--border);
+      border-radius: 0;
+      background: #0b0e14;
+      overflow: hidden;
+    }
+
+    .pane.active {
+      border-color: var(--accent);
+      box-shadow: none;
+    }
+
+    .pane-header {
+      height: 28px;
+      flex: 0 0 28px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 0 8px;
+      border-bottom: 1px solid var(--border);
+      background: var(--panel);
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .pane.active .pane-header {
+      color: var(--text);
+    }
+
+    .pane-cwd {
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .pane-action {
+      width: 20px;
+      height: 20px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border: 0;
+      border-radius: 4px;
+      background: transparent;
+      color: var(--muted);
+      font-size: 11px;
+      padding: 0;
+      cursor: pointer;
+      line-height: 1;
+    }
+
+    .pane-action.close {
+      width: 24px;
+      height: 24px;
+      color: #e06c75;
+      font-size: 15px;
+      font-weight: 700;
+    }
+
+    .pane-action.add {
+      width: 24px;
+      height: 24px;
+      color: var(--accent-2);
+      font-size: 18px;
+      font-weight: 700;
+    }
+
+    .pane-action:hover {
+      background: rgba(255, 255, 255, 0.1);
+      color: var(--text);
+    }
+
+    .pane-action.close:hover {
+      background: #c42b1c;
+      color: white;
+    }
+
+    .pane-action.add:hover {
+      color: var(--accent);
+    }
+
+    .terminal {
+      flex: 1 1 0;
+      position: relative;
+      width: 100%;
+      min-width: 0;
+      min-height: 0;
+      padding: 0;
+      overflow: hidden;
+      background: #0b0e14;
+      font-family: var(--terminal-font-family) !important;
+    }
+
+    .terminal .xterm,
+    .terminal .xterm-screen,
+    .terminal .xterm-rows,
+    .terminal .xterm-char-measure-element,
+    .terminal textarea {
+      font-family: var(--terminal-font-family) !important;
+    }
+
+    .terminal > .xterm {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+    }
+
+    .terminal .xterm-viewport {
+      overflow-y: hidden !important;
+      scrollbar-width: none;
+    }
+
+    .terminal .xterm-viewport::-webkit-scrollbar {
+      display: none;
+    }
+
+    .xterm {
+      width: 100%;
+      height: 100%;
+    }
+
+    /* Fallback for Tauri asset-loading edge cases where xterm.css is not applied. */
+    .xterm {
+      cursor: text;
+      position: relative;
+      user-select: none;
+      -ms-user-select: none;
+      -webkit-user-select: none;
+    }
+
+    .xterm.focus,
+    .xterm:focus {
+      outline: none;
+    }
+
+    .xterm .xterm-helpers {
+      position: absolute;
+      top: 0;
+      z-index: 5;
+    }
+
+    .xterm .xterm-helper-textarea {
+      border: 0;
+      height: 0;
+      left: -9999em;
+      opacity: 0;
+      overflow: hidden;
+      padding: 0;
+      position: absolute;
+      resize: none;
+      top: 0;
+      white-space: nowrap;
+      width: 0;
+      z-index: -5;
+    }
+
+    .xterm .composition-view {
+      background: #0b0e14;
+      color: #dcdfe4;
+      display: none;
+      position: absolute;
+      white-space: nowrap;
+      z-index: 1;
+    }
+
+    .xterm .composition-view.active {
+      display: block;
+    }
+
+    .xterm .xterm-viewport {
+      background-color: #0b0e14;
+      cursor: default;
+      overflow-y: scroll;
+      position: absolute;
+      inset: 0;
+    }
+
+    .xterm .xterm-screen {
+      position: relative;
+    }
+
+    .xterm .xterm-screen canvas {
+      left: 0;
+      position: absolute;
+      top: 0;
+    }
+
+    .xterm .xterm-scroll-area {
+      visibility: hidden;
+    }
+
+    .xterm-char-measure-element {
+      display: inline-block;
+      left: -9999em;
+      line-height: normal;
+      position: absolute;
+      top: 0;
+      visibility: hidden;
+    }
+
+    .xterm .xterm-accessibility:not(.debug),
+    .xterm .xterm-message {
+      bottom: 0;
+      color: transparent;
+      left: 0;
+      pointer-events: none;
+      position: absolute;
+      right: 0;
+      top: 0;
+      z-index: 10;
+    }
+
+    .xterm .xterm-accessibility-tree:not(.debug) *::selection {
+      color: transparent;
+    }
+
+    .xterm .xterm-accessibility-tree {
+      font-family: var(--terminal-font-family), monospace;
+      user-select: text;
+      white-space: pre;
+    }
+
+    .xterm .xterm-accessibility-tree > div {
+      transform-origin: left;
+      width: fit-content;
+    }
+
+    .xterm .live-region {
+      height: 1px;
+      left: -9999px;
+      overflow: hidden;
+      position: absolute;
+      width: 1px;
+    }
+
+    .xterm-dim {
+      opacity: 1 !important;
+    }
+
+    .xterm-underline-1 { text-decoration: underline; }
+    .xterm-underline-2 { text-decoration: double underline; }
+    .xterm-underline-3 { text-decoration: wavy underline; }
+    .xterm-underline-4 { text-decoration: dotted underline; }
+    .xterm-underline-5 { text-decoration: dashed underline; }
+
+    .xterm-overline {
+      text-decoration: overline;
+    }
+
+    .xterm-overline.xterm-underline-1 { text-decoration: overline underline; }
+    .xterm-overline.xterm-underline-2 { text-decoration: overline double underline; }
+    .xterm-overline.xterm-underline-3 { text-decoration: overline wavy underline; }
+    .xterm-overline.xterm-underline-4 { text-decoration: overline dotted underline; }
+    .xterm-overline.xterm-underline-5 { text-decoration: overline dashed underline; }
+
+    .xterm-strikethrough {
+      text-decoration: line-through;
+    }
+
+    .xterm-screen .xterm-decoration-container .xterm-decoration {
+      position: absolute;
+      z-index: 6;
+    }
+
+    .xterm-screen .xterm-decoration-container .xterm-decoration.xterm-decoration-top-layer {
+      z-index: 7;
+    }
+
+    .xterm-decoration-overview-ruler {
+      pointer-events: none;
+      position: absolute;
+      right: 0;
+      top: 0;
+      z-index: 8;
+    }
+
+    .xterm-decoration-top {
+      position: relative;
+      z-index: 2;
+    }
+
+    /* DOM renderer fallback: make SGR attributes visible when canvas is unavailable. */
+    .xterm .xterm-rows {
+      background: #0b0e14;
+      color: #dcdfe4;
+      white-space: pre;
+    }
+
+    .xterm .xterm-rows > div {
+      white-space: nowrap;
+    }
+
+    .xterm .xterm-rows span {
+      font-family: inherit;
+    }
+
+    .xterm .xterm-bold { font-weight: 700 !important; }
+    .xterm .xterm-italic { font-style: italic !important; }
+
+    .xterm .xterm-fg-0 { color: #282c34 !important; }
+    .xterm .xterm-fg-1 { color: #e06c75 !important; }
+    .xterm .xterm-fg-2 { color: #98c379 !important; }
+    .xterm .xterm-fg-3 { color: #e5c07b !important; }
+    .xterm .xterm-fg-4 { color: #61afef !important; }
+    .xterm .xterm-fg-5 { color: #c678dd !important; }
+    .xterm .xterm-fg-6 { color: #56b6c2 !important; }
+    .xterm .xterm-fg-7 { color: #abb2bf !important; }
+    .xterm .xterm-fg-8 { color: #5c6370 !important; }
+    .xterm .xterm-fg-9 { color: #e06c75 !important; }
+    .xterm .xterm-fg-10 { color: #98c379 !important; }
+    .xterm .xterm-fg-11 { color: #e5c07b !important; }
+    .xterm .xterm-fg-12 { color: #61afef !important; }
+    .xterm .xterm-fg-13 { color: #c678dd !important; }
+    .xterm .xterm-fg-14 { color: #56b6c2 !important; }
+    .xterm .xterm-fg-15 { color: #ffffff !important; }
+
+    .xterm .xterm-bg-0 { background-color: #282c34 !important; }
+    .xterm .xterm-bg-1 { background-color: #e06c75 !important; }
+    .xterm .xterm-bg-2 { background-color: #98c379 !important; }
+    .xterm .xterm-bg-3 { background-color: #e5c07b !important; }
+    .xterm .xterm-bg-4 { background-color: #61afef !important; }
+    .xterm .xterm-bg-5 { background-color: #c678dd !important; }
+    .xterm .xterm-bg-6 { background-color: #56b6c2 !important; }
+    .xterm .xterm-bg-7 { background-color: #abb2bf !important; }
+    .xterm .xterm-bg-8 { background-color: #5c6370 !important; }
+    .xterm .xterm-bg-9 { background-color: #e06c75 !important; }
+    .xterm .xterm-bg-10 { background-color: #98c379 !important; }
+    .xterm .xterm-bg-11 { background-color: #e5c07b !important; }
+    .xterm .xterm-bg-12 { background-color: #61afef !important; }
+    .xterm .xterm-bg-13 { background-color: #c678dd !important; }
+    .xterm .xterm-bg-14 { background-color: #56b6c2 !important; }
+    .xterm .xterm-bg-15 { background-color: #ffffff !important; }
+
+    #status {
+      margin-left: auto;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <div id="titleBar">
+      <div class="brand">VIBETERM</div>
+      <div id="tabBar"></div>
+      <div id="newTabButton" role="button" title="新建标签页">+</div>
+      <div class="titlebar-drag"></div>
+      <div id="windowControls">
+        <button id="settingsButton" class="window-control" title="设置">&#xE713;</button>
+        <button id="windowMinimize" class="window-control" title="最小化">&#xE921;</button>
+        <button id="windowMaximize" class="window-control" title="最大化">&#xE922;</button>
+        <button id="windowClose" class="window-control close" title="关闭">&#xE8BB;</button>
+      </div>
+    </div>
+    <div id="settingsPanel" hidden>
+      <div class="settings-title">终端设置</div>
+      <div class="settings-content">
+        <div class="settings-column">
+          <div class="settings-section-title">显示</div>
+          <label class="settings-row">
+            <span>字体</span>
+            <select id="terminalFontSelect">
+              <option value="Cascadia Mono, Cascadia Code, Consolas, monospace">加载系统字体...</option>
+            </select>
+          </label>
+          <label class="settings-row">
+            <span>字号</span>
+            <input id="terminalFontSizeInput" type="number" min="10" max="32" step="1" value="14">
+          </label>
+          <div class="settings-actions">
+            <button id="resetFontButton" type="button">重置</button>
+          </div>
+        </div>
+        <div class="settings-column">
+          <div class="settings-section">
+            <div class="settings-section-title">更新</div>
+            <div class="settings-version">
+              <span>当前版本</span>
+              <span id="appVersionText">-</span>
+            </div>
+            <div id="updateStatus" class="update-status">未检查更新</div>
+            <button id="checkUpdateButton" class="settings-primary-action" type="button">检查更新</button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div id="workspace"></div>
+    <div id="statusBar"><span id="status">Loading xterm.js...</span></div>
+  </div>
+  <script>
+    (function () {
+      if (typeof window.queueMicrotask !== 'function') {
+        window.queueMicrotask = callback => Promise.resolve()
+          .then(callback)
+          .catch(error => setTimeout(() => { throw error; }, 0));
+      }
+
+      try {
+        if (!navigator.platform) {
+          Object.defineProperty(navigator, 'platform', {
+            value: (navigator.userAgentData && navigator.userAgentData.platform) || 'Win32',
+            configurable: true,
+          });
+        }
+      } catch (error) {}
+
+      if (typeof window.ResizeObserver !== 'function') {
+        window.ResizeObserver = class {
+          constructor(callback) {
+            this.callback = callback;
+            this.entries = new Map();
+            this.timer = null;
+          }
+
+          observe(element) {
+            this.entries.set(element, { width: 0, height: 0 });
+            if (this.timer === null) {
+              this.timer = setInterval(() => this.check(), 160);
+            }
+            this.check();
+          }
+
+          unobserve(element) {
+            this.entries.delete(element);
+            if (this.entries.size === 0) {
+              this.disconnect();
+            }
+          }
+
+          disconnect() {
+            if (this.timer !== null) {
+              clearInterval(this.timer);
+              this.timer = null;
+            }
+            this.entries.clear();
+          }
+
+          check() {
+            const changed = [];
+            for (const [element, previous] of this.entries) {
+              const rect = element.getBoundingClientRect();
+              if (rect.width !== previous.width || rect.height !== previous.height) {
+                this.entries.set(element, { width: rect.width, height: rect.height });
+                changed.push({ target: element, contentRect: rect });
+              }
+            }
+            if (changed.length > 0) {
+              this.callback(changed, this);
+            }
+          }
+        };
+      }
+
+      window.vibeTermInvoke = function (payload) {
+        const invoke = window.__TAURI__ && window.__TAURI__.core && typeof window.__TAURI__.core.invoke === 'function'
+          ? window.__TAURI__.core.invoke.bind(window.__TAURI__.core)
+          : null;
+        if (!invoke) {
+          return Promise.resolve(null);
+        }
+        return invoke('frontend_message', { message: JSON.stringify(payload) });
+      };
+
+      function showStartupError(message) {
+        const status = document.getElementById('status');
+        const statusBar = document.getElementById('statusBar');
+        if (status) status.textContent = message;
+        if (statusBar) statusBar.hidden = false;
+      }
+
+      function reportStartupError(payload) {
+        if (typeof window.vibeTermInvoke === 'function') {
+          window.vibeTermInvoke({
+            type: 'frontendError',
+            message: payload.message || 'unknown error',
+            source: payload.source || '',
+            line: payload.line || 0,
+            column: payload.column || 0,
+            stack: payload.stack || '',
+          }).catch(() => {});
+        }
+      }
+
+      window.addEventListener('error', (event) => {
+        const message = event.message || 'unknown error';
+        showStartupError(`前端脚本错误：${message}`);
+        reportStartupError({
+          message,
+          source: event.filename,
+          line: event.lineno,
+          column: event.colno,
+          stack: event.error && event.error.stack ? String(event.error.stack) : '',
+        });
+      });
+
+      window.addEventListener('unhandledrejection', (event) => {
+        const reason = event.reason && (event.reason.message || event.reason);
+        const message = reason || 'unknown error';
+        showStartupError(`前端异步错误：${message}`);
+        reportStartupError({
+          message,
+          stack: event.reason && event.reason.stack ? String(event.reason.stack) : '',
+        });
+      });
+    })();
+  </script>
+  <script src="./vendor/xterm/xterm.js"></script>
+  <script src="./vendor/xterm/addon-fit.js"></script>
+  <script src="./vendor/xterm/addon-canvas.js"></script>
+  <script src="./vendor/xterm/addon-clipboard.js"></script>
+  <script src="./vendor/xterm/addon-unicode11.js"></script>
+  <script>
+    const tabs = new Map();
+    const panes = new Map();
+    const pendingOutput = new Map();
+    const fallbackCols = 120;
+    const fallbackRows = 30;
+    let activeTabId = null;
+    let activePaneId = null;
+    let maxPanesPerTab = 6;
+    let systemFontFamilies = [];
+    let backendListenerBound = false;
+
+    const titleBar = document.getElementById('titleBar');
+    const tabBar = document.getElementById('tabBar');
+    const newTabButton = document.getElementById('newTabButton');
+    const settingsButton = document.getElementById('settingsButton');
+    const settingsPanel = document.getElementById('settingsPanel');
+    const terminalFontSelect = document.getElementById('terminalFontSelect');
+    const terminalFontSizeInput = document.getElementById('terminalFontSizeInput');
+    const resetFontButton = document.getElementById('resetFontButton');
+    const appVersionText = document.getElementById('appVersionText');
+    const updateStatus = document.getElementById('updateStatus');
+    const checkUpdateButton = document.getElementById('checkUpdateButton');
+    const workspace = document.getElementById('workspace');
+    const statusBar = document.getElementById('statusBar');
+    const status = document.getElementById('status');
+
+    const defaultTerminalFont = 'Cascadia Mono, Cascadia Code, Consolas, monospace';
+    const defaultTerminalFontSize = 14;
+    const minTerminalFontSize = 10;
+    const maxTerminalFontSize = 32;
+    const terminalSettings = {
+      fontFamily: defaultTerminalFont,
+      fontSize: defaultTerminalFontSize,
+    };
+    let appVersion = '';
+    let latestUpdate = null;
+    let updateCheckInFlight = false;
+    let updateInstallInFlight = false;
+    let updateButtonMode = 'check';
+
+    function makeTerminalOptions() {
+      return {
+        allowProposedApi: true,
+        rendererType: 'canvas',
+        cursorBlink: true,
+        fontFamily: terminalSettings.fontFamily,
+        fontSize: terminalSettings.fontSize,
+        fontWeight: 'normal',
+        fontWeightBold: 'bold',
+        letterSpacing: 0,
+        lineHeight: 1.2,
+        customGlyphs: true,
+        rescaleOverlappingGlyphs: true,
+        windowsPty: {
+          backend: 'conpty',
+          buildNumber: 19044,
+        },
+        scrollback: 10000,
+        scrollbarWidth: 0,
+        theme: {
+          background: '#0b0e14',
+          foreground: '#dcdfe4',
+          cursor: '#c678dd',
+          selectionBackground: '#3e4451',
+          black: '#282c34',
+          red: '#e06c75',
+          green: '#98c379',
+          yellow: '#e5c07b',
+          blue: '#61afef',
+          magenta: '#c678dd',
+          cyan: '#56b6c2',
+          white: '#abb2bf',
+          brightBlack: '#5c6370',
+          brightRed: '#e06c75',
+          brightGreen: '#98c379',
+          brightYellow: '#e5c07b',
+          brightBlue: '#61afef',
+          brightMagenta: '#c678dd',
+          brightCyan: '#56b6c2',
+          brightWhite: '#ffffff',
+        },
+      };
+    }
+
+    function post(message) {
+      if (typeof window.vibeTermInvoke !== 'function') {
+        return Promise.resolve(null);
+      }
+      return window.vibeTermInvoke(message).catch(error => {
+        console.error('frontend_message invoke failed', error);
+        setStatus(String(error));
+        return null;
+      });
+    }
+
+    function setStatus(message) {
+      const text = message || '';
+      status.textContent = text;
+      statusBar.hidden = text.length === 0;
+    }
+
+    function activePane() {
+      return panes.get(activePaneId) || null;
+    }
+
+    function bytesFromBase64(dataBase64) {
+      const binary = atob(dataBase64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i += 1) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+      return bytes;
+    }
+
+    function quoteFontFamily(fontFamily) {
+      return `"${fontFamily.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+    }
+
+    function appendFontOption(value, label) {
+      const option = document.createElement('option');
+      option.value = value;
+      option.textContent = label;
+      terminalFontSelect.appendChild(option);
+    }
+
+    function populateFontSelect(fontFamilies) {
+      systemFontFamilies = Array.from(new Set((fontFamilies || [])
+        .map(fontFamily => String(fontFamily).trim())
+        .filter(Boolean)));
+      systemFontFamilies.sort((left, right) => left.localeCompare(right, undefined, { sensitivity: 'base' }));
+
+      terminalFontSelect.replaceChildren();
+      appendFontOption(defaultTerminalFont, '默认');
+      for (const fontFamily of systemFontFamilies) {
+        appendFontOption(quoteFontFamily(fontFamily), fontFamily);
+      }
+      if (!systemFontFamilies.some(fontFamily => fontFamily.toLowerCase() === 'monospace')) {
+        appendFontOption('monospace', 'monospace');
+      }
+      syncFontSelect();
+    }
+
+    function syncFontSelect() {
+      if (!Array.from(terminalFontSelect.options).some(option => option.value === terminalSettings.fontFamily)) {
+        const option = document.createElement('option');
+        option.value = terminalSettings.fontFamily;
+        option.textContent = '已保存字体';
+        terminalFontSelect.appendChild(option);
+      }
+      terminalFontSelect.value = terminalSettings.fontFamily;
+    }
+
+    function normalizeFontSize(value) {
+      const parsed = Number.parseInt(value, 10);
+      if (Number.isNaN(parsed)) {
+        return defaultTerminalFontSize;
+      }
+      return Math.min(maxTerminalFontSize, Math.max(minTerminalFontSize, parsed));
+    }
+
+    function syncSettingsControls() {
+      syncFontSelect();
+      terminalFontSizeInput.value = String(terminalSettings.fontSize);
+    }
+
+    function syncTerminalFontCss() {
+      document.documentElement.style.setProperty('--terminal-font-family', terminalSettings.fontFamily);
+    }
+
+    function applyFontToTerminalElement(element) {
+      element.style.setProperty('font-family', terminalSettings.fontFamily, 'important');
+      for (const node of element.querySelectorAll('.xterm, .xterm-screen, .xterm-rows, .xterm-char-measure-element, textarea')) {
+        node.style.setProperty('font-family', terminalSettings.fontFamily, 'important');
+      }
+    }
+
+    function setTerminalFontOption(term) {
+      try {
+        term.options.fontFamily = terminalSettings.fontFamily;
+        term.options.fontSize = terminalSettings.fontSize;
+        term.options.letterSpacing = 0;
+        term.options.customGlyphs = true;
+        term.options.rescaleOverlappingGlyphs = true;
+      } catch (error) {}
+      if (typeof term.setOption === 'function') {
+        try {
+          term.setOption('fontFamily', terminalSettings.fontFamily);
+          term.setOption('fontSize', terminalSettings.fontSize);
+          term.setOption('letterSpacing', 0);
+          term.setOption('customGlyphs', true);
+          term.setOption('rescaleOverlappingGlyphs', true);
+        } catch (error) {}
+      }
+      if (typeof term.clearTextureAtlas === 'function') {
+        try {
+          term.clearTextureAtlas();
+        } catch (error) {}
+      }
+      if (typeof term.refresh === 'function' && term.rows > 0) {
+        term.refresh(0, term.rows - 1);
+      }
+    }
+
+    function setSettingsOpen(open) {
+      settingsPanel.hidden = !open;
+      if (open) {
+        syncSettingsControls();
+        terminalFontSelect.focus();
+      }
+    }
+
+    function persistSettings() {
+      post({
+        type: 'updateSettings',
+        fontFamily: terminalSettings.fontFamily,
+        fontSize: terminalSettings.fontSize,
+      });
+    }
+
+    function applyTerminalAppearance({ fontFamily = terminalSettings.fontFamily, fontSize = terminalSettings.fontSize } = {}) {
+      terminalSettings.fontFamily = String(fontFamily).trim() || defaultTerminalFont;
+      terminalSettings.fontSize = normalizeFontSize(fontSize);
+      syncTerminalFontCss();
+      syncSettingsControls();
+      for (const pane of panes.values()) {
+        pane.updateFont();
+      }
+      persistSettings();
+      requestAnimationFrame(fitVisiblePanes);
+    }
+
+    function terminalFontsReady() {
+      if (!document.fonts) {
+        return true;
+      }
+      return document.fonts.status !== 'loading';
+    }
+
+    function visibleTerminalDimensions(term) {
+      const dimensions = term && term._core && term._core._renderService
+        ? term._core._renderService.dimensions
+        : null;
+      if (!dimensions || !dimensions.css || !dimensions.css.cell ||
+          !dimensions.css.cell.width || !dimensions.css.cell.height) {
+        return null;
+      }
+      return dimensions;
+    }
+
+    function panePixelSize(rect) {
+      return {
+        pixelWidth: Math.max(1, Math.floor(rect.width)),
+        pixelHeight: Math.max(1, Math.floor(rect.height)),
+      };
+    }
+
+    function terminalUsesAlternateScreen(term) {
+      try {
+        if (term && term.buffer && term.buffer.active && term.buffer.active.type === 'alternate') {
+          return true;
+        }
+        return Boolean(term && term._core && term._core.buffers &&
+          term._core.buffers.active === term._core.buffers.alt);
+      } catch (error) {
+        return false;
+      }
+    }
+
+    function terminalMouseTrackingMode(term) {
+      try {
+        return term && term.modes ? term.modes.mouseTrackingMode : 'none';
+      } catch (error) {
+        return 'none';
+      }
+    }
+
+    function wheelLineCount(event) {
+      const rawDelta = Math.abs(event.deltaY || 0);
+      if (rawDelta === 0) {
+        return 0;
+      }
+      if (event.deltaMode === WheelEvent.DOM_DELTA_PAGE) {
+        return 12;
+      }
+      if (event.deltaMode === WheelEvent.DOM_DELTA_LINE) {
+        return Math.max(1, Math.min(12, Math.round(rawDelta)));
+      }
+      return Math.max(1, Math.min(12, Math.round(rawDelta / 40)));
+    }
+
+    function scrollInputForWheel(term, event) {
+      const up = event.deltaY < 0;
+      // opencode binds line-by-line message scrolling to Ctrl+Alt+Y/E.
+      // In terminals, Alt is encoded as an ESC prefix and Ctrl+Y/E are 0x19/0x05.
+      return up ? '\x1b\x19' : '\x1b\x05';
+    }
+
+    function setUpdateStatus(message, kind = '') {
+      updateStatus.textContent = message || '';
+      updateStatus.className = `update-status${kind ? ` ${kind}` : ''}`;
+    }
+
+    function setUpdateButton(mode, { disabled = false } = {}) {
+      updateButtonMode = mode;
+      checkUpdateButton.disabled = disabled;
+      checkUpdateButton.textContent = mode === 'install' ? '立即更新' : '检查更新';
+      if (mode === 'checking') {
+        checkUpdateButton.textContent = '检查中...';
+      } else if (mode === 'installing') {
+        checkUpdateButton.textContent = '更新中...';
+      } else if (mode === 'launched') {
+        checkUpdateButton.textContent = '已启动安装';
+      }
+    }
+
+    function checkForUpdates(manual) {
+      if (updateCheckInFlight || updateInstallInFlight) {
+        return;
+      }
+      updateCheckInFlight = true;
+      latestUpdate = null;
+      setUpdateButton('checking', { disabled: true });
+      setUpdateStatus(manual ? '正在检查更新...' : '正在自动检查更新...');
+      post({ type: 'checkForUpdates', manual: Boolean(manual) });
+    }
+
+    function installLatestUpdate(silent) {
+      if (updateInstallInFlight) {
+        return;
+      }
+      if (!latestUpdate || !latestUpdate.assetUrl) {
+        setUpdateStatus('没有可下载安装的更新包。', 'warning');
+        setUpdateButton('check');
+        return;
+      }
+      updateInstallInFlight = true;
+      setUpdateButton('installing', { disabled: true });
+      setUpdateStatus(silent ? `正在自动下载 ${latestUpdate.version}...` : `正在下载 ${latestUpdate.version}...`);
+      post({
+        type: 'installUpdate',
+        version: latestUpdate.version,
+        assetUrl: latestUpdate.assetUrl,
+        silent: Boolean(silent),
+      });
+    }
+
+    function handleUpdateButtonClick() {
+      if (updateButtonMode === 'install' && latestUpdate && latestUpdate.assetUrl) {
+        installLatestUpdate(false);
+        return;
+      }
+      checkForUpdates(true);
+    }
+
+    function copyPaneSelection(pane) {
+      if (!pane) {
+        return false;
+      }
+      post({ type: 'copyToClipboard', text: pane.currentSelection() });
+      return true;
+    }
+
+    function pasteIntoPane(pane) {
+      if (!pane) {
+        return false;
+      }
+      post({ type: 'pasteFromClipboard', paneId: pane.id });
+      return true;
+    }
+
+    function xtermCssLoaded() {
+      const link = document.getElementById('xtermCss');
+      if (!link) {
+        return false;
+      }
+      try {
+        return Boolean(link.sheet && link.sheet.cssRules && link.sheet.cssRules.length > 0);
+      } catch (error) {
+        return Boolean(link.sheet);
+      }
+    }
+
+    function xtermAnsiColor(index) {
+      const basic = [
+        '#282c34', '#e06c75', '#98c379', '#e5c07b',
+        '#61afef', '#c678dd', '#56b6c2', '#abb2bf',
+        '#5c6370', '#e06c75', '#98c379', '#e5c07b',
+        '#61afef', '#c678dd', '#56b6c2', '#ffffff',
+      ];
+      if (index < basic.length) {
+        return basic[index];
+      }
+      if (index >= 16 && index <= 231) {
+        const value = index - 16;
+        const r = Math.floor(value / 36);
+        const g = Math.floor((value % 36) / 6);
+        const b = value % 6;
+        const channel = n => (n === 0 ? 0 : 55 + n * 40);
+        return `rgb(${channel(r)}, ${channel(g)}, ${channel(b)})`;
+      }
+      if (index >= 232 && index <= 255) {
+        const level = 8 + (index - 232) * 10;
+        return `rgb(${level}, ${level}, ${level})`;
+      }
+      return '#dcdfe4';
+    }
+
+    function installXtermAnsiPaletteFallback() {
+      if (document.getElementById('xtermAnsiPaletteFallback')) {
+        return;
+      }
+      const style = document.createElement('style');
+      style.id = 'xtermAnsiPaletteFallback';
+      let css = '';
+      for (let index = 0; index < 256; index += 1) {
+        const color = xtermAnsiColor(index);
+        css += `.xterm .xterm-fg-${index}{color:${color} !important;}`;
+        css += `.xterm .xterm-bg-${index}{background-color:${color} !important;}`;
+      }
+      style.textContent = css;
+      document.head.appendChild(style);
+    }
+
+    function cssColorToHex(color) {
+      const value = String(color || '').trim();
+      const hex = value.match(/^#([0-9a-f]{3}|[0-9a-f]{6})$/i);
+      if (hex) {
+        const raw = hex[1].toLowerCase();
+        return raw.length === 3
+          ? raw.split('').map(ch => ch + ch).join('')
+          : raw;
+      }
+      const rgb = value.match(/^rgba?\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})/i);
+      if (rgb) {
+        return [rgb[1], rgb[2], rgb[3]]
+          .map(part => Math.max(0, Math.min(255, Number(part))).toString(16).padStart(2, '0'))
+          .join('');
+      }
+      return '';
+    }
+
+    function inlineStyleColor(styleText, property) {
+      const pattern = new RegExp(`${property}\\s*:\\s*([^;]+)`, 'i');
+      const match = String(styleText || '').match(pattern);
+      return match ? match[1].trim() : '';
+    }
+
+    function ensureTruecolorClass(kind, color) {
+      const hex = cssColorToHex(color);
+      if (!hex) {
+        return '';
+      }
+      const className = `vibeterm-${kind}-${hex}`;
+      const styleId = `vibeterm-${kind}-style-${hex}`;
+      if (!document.getElementById(styleId)) {
+        const style = document.createElement('style');
+        style.id = styleId;
+        const property = kind === 'bg' ? 'background-color' : 'color';
+        style.textContent = `.xterm .${className}{${property}:#${hex} !important;}`;
+        document.head.appendChild(style);
+      }
+      return className;
+    }
+
+    function normalizeXtermDomColors(root) {
+      if (!root) {
+        return;
+      }
+      const spans = root.matches && root.matches('.xterm-rows span')
+        ? [root]
+        : Array.from(root.querySelectorAll ? root.querySelectorAll('.xterm-rows span') : []);
+
+      for (const span of spans) {
+        const className = typeof span.className === 'string' ? span.className : '';
+        const fgMatch = className.match(/(?:^|\s)xterm-fg-(\d+)(?:\s|$)/);
+        const bgMatch = className.match(/(?:^|\s)xterm-bg-(\d+)(?:\s|$)/);
+
+        if (fgMatch) {
+          span.style.setProperty('color', xtermAnsiColor(Number(fgMatch[1])), 'important');
+        } else {
+          const inlineColor = inlineStyleColor(span.getAttribute('style'), 'color') || span.style.color;
+          if (inlineColor) {
+            const truecolorClass = ensureTruecolorClass('fg', inlineColor);
+            if (truecolorClass && !span.classList.contains(truecolorClass)) {
+              span.classList.add(truecolorClass);
+            }
+            span.style.setProperty('color', inlineColor, 'important');
+          }
+        }
+
+        if (bgMatch) {
+          span.style.setProperty('background-color', xtermAnsiColor(Number(bgMatch[1])), 'important');
+        } else {
+          const inlineBackground = inlineStyleColor(span.getAttribute('style'), 'background-color') || span.style.backgroundColor;
+          if (inlineBackground) {
+            const truecolorClass = ensureTruecolorClass('bg', inlineBackground);
+            if (truecolorClass && !span.classList.contains(truecolorClass)) {
+              span.classList.add(truecolorClass);
+            }
+            span.style.setProperty('background-color', inlineBackground, 'important');
+          }
+        }
+
+        if (className.includes('xterm-bold')) {
+          span.style.setProperty('font-weight', '700', 'important');
+        }
+      }
+    }
+
+    function spanInfoFor(spans, label) {
+      const span = spans.find(item => item.textContent.includes(label));
+      if (!span) {
+        return 'no-span';
+      }
+      const style = getComputedStyle(span);
+      return `${span.className || 'no-class'}|color=${style.color}|weight=${style.fontWeight}|dec=${style.textDecorationLine || 'none'}|style=${span.getAttribute('style') || ''}`;
+    }
+
+    function copyDiagnosticText(text) {
+      if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        navigator.clipboard.writeText(text).catch(() => {});
+      }
+      post({ type: 'copyToClipboard', text });
+    }
+
+    function collectAnsiSelfTestDiagnostics(pane) {
+      const xterm = pane.terminalElement.querySelector('.xterm');
+      const accessibility = pane.terminalElement.querySelector('.xterm-accessibility');
+      const canvasCount = pane.terminalElement.querySelectorAll('.xterm-screen canvas').length;
+      const rowsCount = pane.terminalElement.querySelectorAll('.xterm-rows > div').length;
+      const accessibilityColor = accessibility ? getComputedStyle(accessibility).color : 'missing';
+      const spans = Array.from(pane.terminalElement.querySelectorAll('.xterm-rows span'));
+      const redInfo = spanInfoFor(spans, 'RED');
+      const ansi256Info = spanInfoFor(spans, 'ANSI256');
+      const truecolorInfo = spanInfoFor(spans, 'TRUECOLOR');
+      const lastSpanInfo = spans.slice(-8).map((span, index) => {
+        const style = getComputedStyle(span);
+        return `${index}:${JSON.stringify(span.textContent)}|class=${span.className || 'no-class'}|color=${style.color}|weight=${style.fontWeight}|style=${span.getAttribute('style') || ''}`;
+      }).join(' || ');
+      const canvas2d = (() => {
+        try {
+          return Boolean(document.createElement('canvas').getContext('2d'));
+        } catch (error) {
+          return false;
+        }
+      })();
+      const renderer = pane.term.options && pane.term.options.rendererType ? pane.term.options.rendererType : 'unknown';
+      return `renderer=${renderer}; canvas2d=${canvas2d}; xterm.css=${xtermCssLoaded() ? 'loaded' : 'NOT loaded'}; canvas=${canvasCount}; rows=${rowsCount}; spans=${spans.length}; red=${redInfo}; ansi256=${ansi256Info}; truecolor=${truecolorInfo}; accessibilityColor=${accessibilityColor}; xterm=${Boolean(xterm)}; lastSpans=${lastSpanInfo}`;
+    }
+
+    function writeAnsiSelfTest() {
+      const pane = activePane();
+      if (!pane || !pane.opened) {
+        setStatus('ANSI 自检失败：没有可用终端 Pane');
+        return false;
+      }
+      installXtermAnsiPaletteFallback();
+      const testText = '\r\n\x1b[31mRED\x1b[0m \x1b[1mBOLD\x1b[0m \x1b[4mUNDERLINE\x1b[0m \x1b[38;5;202mANSI256\x1b[0m \x1b[38;2;224;108;117mTRUECOLOR\x1b[0m\r\n┌─ frontend ansi self test ─┐\r\n';
+      pane.term.write(testText, () => {
+        requestAnimationFrame(() => {
+          setTimeout(() => {
+            normalizeXtermDomColors(pane.terminalElement);
+            const diagnostics = collectAnsiSelfTestDiagnostics(pane);
+            setStatus(`ANSI 自检诊断已复制；${diagnostics}`);
+            copyDiagnosticText(diagnostics);
+            pane.term.write(`\r\n[VibeTerm ANSI diagnostics copied]\r\n${diagnostics}\r\n`);
+          }, 40);
+        });
+      });
+      return true;
+    }
+
+    function stopKeyboardShortcut(event) {
+      event.preventDefault();
+      event.stopPropagation();
+      if (typeof event.stopImmediatePropagation === 'function') {
+        event.stopImmediatePropagation();
+      }
+    }
+
+    function shortcutKeyMatches(event, key) {
+      return event.key.toLowerCase() === key || event.code === `Key${key.toUpperCase()}`;
+    }
+
+    function paneFromEventTarget(target) {
+      const paneElement = target && target.closest ? target.closest('.pane') : null;
+      if (!paneElement) {
+        return activePane();
+      }
+      return panes.get(Number(paneElement.dataset.paneId)) || activePane();
+    }
+
+    function handleTerminalClipboardShortcut(event, pane) {
+      if (event.type !== 'keydown' || !event.ctrlKey || !event.shiftKey || event.altKey) {
+        return true;
+      }
+      if (settingsPanel.contains(event.target)) {
+        return true;
+      }
+      if (shortcutKeyMatches(event, 'c')) {
+        stopKeyboardShortcut(event);
+        copyPaneSelection(pane || paneFromEventTarget(event.target));
+        return false;
+      }
+      if (shortcutKeyMatches(event, 'v')) {
+        stopKeyboardShortcut(event);
+        pasteIntoPane(pane || paneFromEventTarget(event.target));
+        return false;
+      }
+      return true;
+    }
+
+    function makePaneButton(className, title, text, onClick) {
+      const button = document.createElement('button');
+      button.className = className;
+      button.title = title;
+      button.innerHTML = text;
+      button.addEventListener('pointerdown', event => {
+        event.preventDefault();
+        event.stopPropagation();
+      }, true);
+      button.addEventListener('click', event => {
+        event.preventDefault();
+        event.stopPropagation();
+        onClick();
+      });
+      return button;
+    }
+
+    class PaneView {
+      constructor(event, tab) {
+        this.id = event.paneId;
+        this.tabId = event.tabId;
+        this.tab = tab;
+        this.started = false;
+        this.starting = false;
+        this.opened = false;
+        this.deferredFitTimer = null;
+        this.pendingFitFrame = null;
+        this.pendingForceBackendResize = false;
+        this.postStartResizeFrame = null;
+        this.postStartResizeTimer = null;
+        this.colorObserver = null;
+        this.lastFitCols = 0;
+        this.lastFitRows = 0;
+        this.lastFitPixelWidth = 0;
+        this.lastFitPixelHeight = 0;
+        this.exited = Boolean(event.exited);
+        this.selection = '';
+
+        this.element = document.createElement('section');
+        this.element.className = 'pane';
+        this.element.dataset.paneId = String(this.id);
+
+        this.headerElement = document.createElement('div');
+        this.headerElement.className = 'pane-header';
+
+        this.cwdElement = document.createElement('span');
+        this.cwdElement.className = 'pane-cwd';
+        this.cwdElement.textContent = this.label();
+
+        this.addButton = makePaneButton('pane-action add', '新增 Pane', '+', () => {
+          const activeTab = tabs.get(activeTabId);
+          if (!activeTab || activeTab.panes.length < maxPanesPerTab) {
+            post({ type: 'addPane' });
+          }
+        });
+        this.closeButton = makePaneButton('pane-action close', '关闭', '&#10005;', () => {
+          post({ type: 'closePane', paneId: this.id });
+        });
+
+        this.headerElement.append(this.cwdElement, this.addButton, this.closeButton);
+
+        this.terminalElement = document.createElement('div');
+        this.terminalElement.className = 'terminal';
+        applyFontToTerminalElement(this.terminalElement);
+        this.element.append(this.headerElement, this.terminalElement);
+
+        this.term = new window.Terminal(makeTerminalOptions());
+        this.fitAddon = new window.FitAddon.FitAddon();
+        this.term.loadAddon(this.fitAddon);
+        if (window.CanvasAddon && typeof window.CanvasAddon.CanvasAddon === 'function') {
+          this.canvasAddon = new window.CanvasAddon.CanvasAddon();
+          this.term.loadAddon(this.canvasAddon);
+        }
+        if (window.Unicode11Addon && typeof window.Unicode11Addon.Unicode11Addon === 'function') {
+          this.unicode11Addon = new window.Unicode11Addon.Unicode11Addon();
+          this.term.loadAddon(this.unicode11Addon);
+          try {
+            this.term.unicode.activeVersion = '11';
+          } catch (error) {}
+        }
+        if (window.ClipboardAddon && typeof window.ClipboardAddon.ClipboardAddon === 'function') {
+          this.clipboardAddon = new window.ClipboardAddon.ClipboardAddon(undefined, {
+            readText: () => navigator.clipboard ? navigator.clipboard.readText() : Promise.resolve(''),
+            writeText: (_selection, data) => {
+              post({ type: 'copyToClipboard', text: data || this.currentSelection() });
+              return navigator.clipboard ? navigator.clipboard.writeText(data || this.currentSelection()).catch(() => {}) : Promise.resolve();
+            },
+          });
+          this.term.loadAddon(this.clipboardAddon);
+        }
+        this.term.onData(data => post({ type: 'input', paneId: this.id, data }));
+        if (typeof this.term.onSelectionChange === 'function') {
+          this.term.onSelectionChange(() => this.syncSelection());
+        }
+        this.term.attachCustomKeyEventHandler(event => handleTerminalClipboardShortcut(event, this));
+        this.terminalElement.addEventListener('mousedown', () => this.focus(true));
+        this.element.addEventListener('wheel', event => this.handleWheel(event), {
+          passive: false,
+          capture: true,
+        });
+        this.resizeObserver = new ResizeObserver(() => {
+          this.scheduleFitAndStart();
+        });
+        this.resizeObserver.observe(this.terminalElement);
+      }
+
+      attach() {
+        this.tab.content.appendChild(this.element);
+      }
+
+      activate() {
+        if (!this.element.isConnected) {
+          return;
+        }
+        this.openTerminal();
+        this.flushPendingOutput();
+        this.scheduleFitAndStart({ forceBackendResize: true });
+      }
+
+      openTerminal() {
+        if (this.opened) {
+          return;
+        }
+        this.term.open(this.terminalElement);
+        this.opened = true;
+        applyFontToTerminalElement(this.terminalElement);
+        this.installColorObserver();
+        normalizeXtermDomColors(this.terminalElement);
+      }
+
+      installColorObserver() {
+        if (this.colorObserver || typeof MutationObserver !== 'function') {
+          return;
+        }
+        this.colorObserver = new MutationObserver(mutations => {
+          for (const mutation of mutations) {
+            if (mutation.type === 'attributes' && mutation.target.nodeType === Node.ELEMENT_NODE) {
+              normalizeXtermDomColors(mutation.target);
+              continue;
+            }
+            for (const node of mutation.addedNodes) {
+              if (node.nodeType === Node.ELEMENT_NODE) {
+                normalizeXtermDomColors(node);
+              }
+            }
+          }
+        });
+        this.colorObserver.observe(this.terminalElement, {
+          attributes: true,
+          attributeFilter: ['class', 'style'],
+          childList: true,
+          subtree: true,
+        });
+      }
+
+      scheduleFitAndStart({ forceBackendResize = false } = {}) {
+        this.pendingForceBackendResize = this.pendingForceBackendResize || forceBackendResize;
+        if (this.pendingFitFrame !== null) {
+          cancelAnimationFrame(this.pendingFitFrame);
+          this.pendingFitFrame = null;
+        }
+        const runFitAndStart = () => {
+          const shouldForceBackendResize = this.pendingForceBackendResize;
+          const size = this.fit({ forceBackendResize: shouldForceBackendResize });
+          if (size || !shouldForceBackendResize) {
+            this.pendingForceBackendResize = false;
+          }
+          this.ensureStarted();
+        };
+        const scheduleFrame = framesRemaining => {
+          this.pendingFitFrame = requestAnimationFrame(() => {
+            if (framesRemaining > 1) {
+              scheduleFrame(framesRemaining - 1);
+              return;
+            }
+            this.pendingFitFrame = null;
+            runFitAndStart();
+          });
+        };
+        scheduleFrame(3);
+        if (this.deferredFitTimer !== null) {
+          clearTimeout(this.deferredFitTimer);
+        }
+        this.deferredFitTimer = setTimeout(() => {
+          this.deferredFitTimer = null;
+          runFitAndStart();
+        }, 160);
+      }
+
+      fit({ forceBackendResize = false } = {}) {
+        if (!this.opened || !this.element.isConnected || this.element.offsetParent === null) {
+          return null;
+        }
+        const rect = this.terminalElement.getBoundingClientRect();
+        if (rect.width < 20 || rect.height < 20) {
+          return null;
+        }
+        try {
+          if (!terminalFontsReady()) {
+            if (document.fonts.ready && typeof document.fonts.ready.then === 'function') {
+              document.fonts.ready.then(() => this.scheduleFitAndStart({ forceBackendResize })).catch(() => {});
+            }
+            return null;
+          }
+          const proposed = typeof this.fitAddon.proposeDimensions === 'function'
+            ? this.fitAddon.proposeDimensions()
+            : null;
+          if (!proposed || !proposed.cols || !proposed.rows) {
+            return null;
+          }
+          const cols = Math.max(2, Math.floor(proposed.cols));
+          const rows = Math.max(1, Math.floor(proposed.rows));
+          const pixels = panePixelSize(rect);
+          if (cols !== this.term.cols || rows !== this.term.rows) {
+            if (this.term._core && this.term._core._renderService) {
+              this.term._core._renderService.clear();
+            }
+            this.term.resize(cols, rows);
+          }
+          const changed = cols !== this.lastFitCols || rows !== this.lastFitRows ||
+            pixels.pixelWidth !== this.lastFitPixelWidth || pixels.pixelHeight !== this.lastFitPixelHeight;
+          this.lastFitCols = cols;
+          this.lastFitRows = rows;
+          this.lastFitPixelWidth = pixels.pixelWidth;
+          this.lastFitPixelHeight = pixels.pixelHeight;
+          if (this.started && (changed || forceBackendResize)) {
+            post({ type: 'resize', paneId: this.id, cols, rows, ...pixels });
+          }
+          return { cols, rows, ...pixels };
+        } catch (error) {
+          setStatus(String(error));
+          return null;
+        }
+      }
+
+      handleWheel(event) {
+        if (!this.opened || !this.started) {
+          return true;
+        }
+        const lines = wheelLineCount(event);
+        if (lines <= 0) {
+          return true;
+        }
+        event.preventDefault();
+        event.stopPropagation();
+        if (typeof event.stopImmediatePropagation === 'function') {
+          event.stopImmediatePropagation();
+        }
+        const repeat = 2;
+        const input = scrollInputForWheel(this.term, event).repeat(repeat);
+        setStatus(`wheel -> ${event.deltaY < 0 ? 'up' : 'down'} x${repeat}`);
+        post({ type: 'input', paneId: this.id, data: input });
+        return false;
+      }
+
+      ensureStarted() {
+        if (this.exited || this.started || this.starting || !this.opened) {
+          return;
+        }
+        const size = this.fit();
+        if (!size) {
+          return;
+        }
+        this.starting = true;
+        try {
+          post({
+            type: 'startPane',
+            paneId: this.id,
+            cols: size.cols,
+            rows: size.rows,
+            pixelWidth: size.pixelWidth,
+            pixelHeight: size.pixelHeight,
+          });
+          this.started = true;
+          this.schedulePostStartResize();
+        } catch (error) {
+          this.started = false;
+          throw error;
+        } finally {
+          this.starting = false;
+        }
+      }
+
+      schedulePostStartResize() {
+        if (this.postStartResizeFrame !== null) {
+          cancelAnimationFrame(this.postStartResizeFrame);
+        }
+        if (this.postStartResizeTimer !== null) {
+          clearTimeout(this.postStartResizeTimer);
+        }
+        this.postStartResizeFrame = requestAnimationFrame(() => {
+          this.postStartResizeFrame = null;
+          this.fit({ forceBackendResize: true });
+        });
+        this.postStartResizeTimer = setTimeout(() => {
+          this.postStartResizeTimer = null;
+          this.fit({ forceBackendResize: true });
+        }, 250);
+      }
+
+      setActive(active) {
+        this.element.classList.toggle('active', active);
+      }
+
+      currentSelection() {
+        const selection = this.term.getSelection();
+        return selection || this.selection;
+      }
+
+      syncSelection() {
+        this.selection = this.term.getSelection();
+        post({ type: 'selectionChanged', paneId: this.id, text: this.selection });
+      }
+
+      syncControls(paneCount) {
+        const closeHidden = paneCount <= 1;
+        const addHidden = paneCount >= maxPanesPerTab;
+        this.closeButton.hidden = closeHidden;
+        this.addButton.hidden = addHidden;
+        this.closeButton.style.display = closeHidden ? 'none' : '';
+        this.addButton.style.display = addHidden ? 'none' : '';
+      }
+
+      focus(notify) {
+        activePaneId = this.id;
+        for (const pane of panes.values()) {
+          const tab = tabs.get(pane.tabId);
+          const canShowActive = tab && tab.panes.length > 1;
+          pane.setActive(canShowActive && pane.id === this.id);
+        }
+        if (this.tabId === activeTabId) {
+          this.activate();
+        }
+        requestAnimationFrame(() => this.term.focus());
+        if (notify) {
+          post({ type: 'selectPane', paneId: this.id });
+        }
+      }
+
+      reset() {
+        pendingOutput.delete(this.id);
+        this.started = false;
+        this.starting = false;
+        this.pendingForceBackendResize = false;
+        if (this.postStartResizeFrame !== null) {
+          cancelAnimationFrame(this.postStartResizeFrame);
+          this.postStartResizeFrame = null;
+        }
+        if (this.postStartResizeTimer !== null) {
+          clearTimeout(this.postStartResizeTimer);
+          this.postStartResizeTimer = null;
+        }
+        this.exited = false;
+        this.selection = '';
+        this.cwdElement.textContent = this.label();
+        post({ type: 'selectionChanged', paneId: this.id, text: '' });
+        this.term.reset();
+        this.term.clear();
+        this.scheduleFitAndStart();
+      }
+
+      write(dataBase64) {
+        if (!this.opened) {
+          const chunks = pendingOutput.get(this.id) || [];
+          chunks.push(dataBase64);
+          pendingOutput.set(this.id, chunks);
+          return;
+        }
+        this.term.write(bytesFromBase64(dataBase64), () => {
+          normalizeXtermDomColors(this.terminalElement);
+        });
+      }
+
+      flushPendingOutput() {
+        const chunks = pendingOutput.get(this.id);
+        if (!chunks) {
+          return;
+        }
+        pendingOutput.delete(this.id);
+        for (const chunk of chunks) {
+          this.write(chunk);
+        }
+      }
+
+      markExited() {
+        this.started = false;
+        this.starting = false;
+        this.pendingForceBackendResize = false;
+        if (this.postStartResizeFrame !== null) {
+          cancelAnimationFrame(this.postStartResizeFrame);
+          this.postStartResizeFrame = null;
+        }
+        if (this.postStartResizeTimer !== null) {
+          clearTimeout(this.postStartResizeTimer);
+          this.postStartResizeTimer = null;
+        }
+        this.exited = true;
+        this.cwdElement.textContent = this.label();
+      }
+
+      label() {
+        return `Pane#${this.id}`;
+      }
+
+      updateFont() {
+        applyFontToTerminalElement(this.terminalElement);
+        setTerminalFontOption(this.term);
+        requestAnimationFrame(() => {
+          applyFontToTerminalElement(this.terminalElement);
+          this.fit();
+        });
+      }
+
+      dispose() {
+        if (this.deferredFitTimer !== null) {
+          clearTimeout(this.deferredFitTimer);
+          this.deferredFitTimer = null;
+        }
+        if (this.pendingFitFrame !== null) {
+          cancelAnimationFrame(this.pendingFitFrame);
+          this.pendingFitFrame = null;
+        }
+        this.pendingForceBackendResize = false;
+        if (this.postStartResizeFrame !== null) {
+          cancelAnimationFrame(this.postStartResizeFrame);
+          this.postStartResizeFrame = null;
+        }
+        if (this.postStartResizeTimer !== null) {
+          clearTimeout(this.postStartResizeTimer);
+          this.postStartResizeTimer = null;
+        }
+        if (this.colorObserver !== null) {
+          this.colorObserver.disconnect();
+          this.colorObserver = null;
+        }
+        pendingOutput.delete(this.id);
+        this.resizeObserver.disconnect();
+        this.term.dispose();
+        this.element.remove();
+      }
+    }
+
+    function syncTabCloseButtons() {
+      const closable = tabs.size > 1;
+      for (const tab of tabs.values()) {
+        tab.close.hidden = !closable;
+        tab.close.style.display = closable ? '' : 'none';
+      }
+    }
+
+    function createTab(event) {
+      if (tabs.has(event.tabId)) {
+        return;
+      }
+
+      const tabId = event.tabId;
+      const button = document.createElement('button');
+      const title = document.createElement('span');
+      title.className = 'tab-title';
+      title.textContent = event.title;
+      const close = document.createElement('span');
+      close.className = 'tab-close';
+      close.textContent = '×';
+      close.title = '关闭标签页';
+      close.addEventListener('pointerdown', event => {
+        event.preventDefault();
+        event.stopPropagation();
+      }, true);
+      close.addEventListener('click', event => {
+        event.preventDefault();
+        event.stopPropagation();
+        post({ type: 'closeTab', tabId });
+      });
+      button.append(title, close);
+      button.addEventListener('click', () => post({ type: 'selectTab', tabId }));
+      tabBar.appendChild(button);
+
+      const content = document.createElement('div');
+      content.className = 'tab-content';
+      workspace.appendChild(content);
+
+      tabs.set(event.tabId, {
+        id: event.tabId,
+        title: event.title,
+        button,
+        close,
+        content,
+        panes: [],
+      });
+      syncTabCloseButtons();
+    }
+
+    function paneLayoutSlot(count, index) {
+      if (count <= 3) {
+        return { column: index + 1, row: 1, rowSpan: 1 };
+      }
+      const slots = [
+        { column: 1, row: 1, rowSpan: 1 },
+        { column: 2, row: 1, rowSpan: count === 4 ? 2 : 1 },
+        { column: 3, row: 1, rowSpan: count <= 5 ? 2 : 1 },
+        { column: 1, row: 2, rowSpan: 1 },
+        { column: 2, row: 2, rowSpan: 1 },
+        { column: 3, row: 2, rowSpan: 1 },
+      ];
+      return slots[index];
+    }
+
+    function layoutTab(tab) {
+      const views = tab.panes.map(id => panes.get(id)).filter(Boolean);
+      const count = views.length;
+      const columns = count <= 3 ? Math.max(1, count) : 3;
+      const rows = count <= 3 ? 1 : 2;
+
+      tab.content.style.gap = '0';
+      tab.content.style.gridTemplateColumns = `repeat(${columns}, minmax(0, 1fr))`;
+      tab.content.style.gridTemplateRows = `repeat(${rows}, minmax(0, 1fr))`;
+
+      views.forEach((pane, index) => {
+        const slot = paneLayoutSlot(count, index);
+        pane.element.style.gridColumn = `${slot.column} / span 1`;
+        pane.element.style.gridRow = `${slot.row} / span ${slot.rowSpan}`;
+        pane.setActive(count > 1 && pane.id === activePaneId);
+        pane.syncControls(count);
+      });
+
+      if (tab.id === activeTabId) {
+        requestAnimationFrame(() => {
+          for (const pane of views) {
+            pane.scheduleFitAndStart();
+          }
+        });
+      }
+    }
+
+    function fitVisiblePanes() {
+      const tab = tabs.get(activeTabId);
+      if (!tab) {
+        return;
+      }
+      for (const paneId of tab.panes) {
+        const pane = panes.get(paneId);
+        if (pane) {
+          pane.fit();
+          pane.ensureStarted();
+        }
+      }
+    }
+
+    function selectTab(tabId) {
+      const tab = tabs.get(tabId);
+      if (!tab) {
+        return;
+      }
+      activeTabId = tabId;
+      for (const existing of tabs.values()) {
+        const active = existing.id === tabId;
+        existing.button.classList.toggle('active', active);
+        existing.content.classList.toggle('active', active);
+      }
+      layoutTab(tab);
+      for (const paneId of tab.panes) {
+        const pane = panes.get(paneId);
+        if (pane) {
+          pane.activate();
+        }
+      }
+    }
+
+    function createPane(event) {
+      const tab = tabs.get(event.tabId);
+      if (!tab || panes.has(event.paneId)) {
+        return;
+      }
+      const pane = new PaneView(event, tab);
+      panes.set(pane.id, pane);
+      tab.panes.push(pane.id);
+      pane.attach();
+      if (event.tabId === activeTabId) {
+        pane.activate();
+      }
+      layoutTab(tab);
+      if (event.active) {
+        selectPane(pane.id);
+      }
+    }
+
+    function selectPane(paneId) {
+      const pane = panes.get(paneId);
+      if (!pane) {
+        return;
+      }
+      selectTab(pane.tabId);
+      pane.focus(false);
+    }
+
+    function resetPane(event) {
+      const pane = panes.get(event.paneId);
+      if (pane) {
+        pane.reset(event);
+      }
+    }
+
+    function closePane(paneId) {
+      const pane = panes.get(paneId);
+      if (!pane) {
+        return;
+      }
+      const tab = tabs.get(pane.tabId);
+      pane.dispose();
+      panes.delete(paneId);
+      if (tab) {
+        tab.panes = tab.panes.filter(id => id !== paneId);
+        layoutTab(tab);
+      }
+      if (activePaneId === paneId) {
+        activePaneId = null;
+      }
+    }
+
+    function closeTab(tabId) {
+      const tab = tabs.get(tabId);
+      if (!tab) {
+        return;
+      }
+      for (const paneId of [...tab.panes]) {
+        const pane = panes.get(paneId);
+        if (pane) {
+          pane.dispose();
+          panes.delete(paneId);
+        }
+      }
+      tab.button.remove();
+      tab.content.remove();
+      tabs.delete(tabId);
+      if (activeTabId === tabId) {
+        activeTabId = null;
+      }
+      syncTabCloseButtons();
+    }
+
+    function writePane(event) {
+      const pane = panes.get(event.paneId);
+      if (!pane) {
+        const chunks = pendingOutput.get(event.paneId) || [];
+        chunks.push(event.dataBase64);
+        pendingOutput.set(event.paneId, chunks);
+        return;
+      }
+      pane.write(event.dataBase64);
+    }
+
+    function markExited(event) {
+      const pane = panes.get(event.paneId);
+      if (pane) {
+        pane.markExited();
+      }
+    }
+
+    function isTitlebarInteractive(target) {
+      return Boolean(target.closest('button, #newTabButton, #tabBar, #windowControls'));
+    }
+
+    function bindUi() {
+      syncSettingsControls();
+      settingsButton.addEventListener('click', event => {
+        event.stopPropagation();
+        setSettingsOpen(settingsPanel.hidden);
+      });
+      terminalFontSelect.addEventListener('change', () => {
+        applyTerminalAppearance({ fontFamily: terminalFontSelect.value });
+      });
+      terminalFontSizeInput.addEventListener('change', () => {
+        applyTerminalAppearance({ fontSize: terminalFontSizeInput.value });
+      });
+      resetFontButton.addEventListener('click', () => {
+        applyTerminalAppearance({
+          fontFamily: defaultTerminalFont,
+          fontSize: defaultTerminalFontSize,
+        });
+      });
+      checkUpdateButton.addEventListener('click', handleUpdateButtonClick);
+      for (const input of [terminalFontSelect, terminalFontSizeInput]) {
+        input.addEventListener('keydown', event => {
+          if (event.key === 'Escape') {
+            setSettingsOpen(false);
+          }
+        });
+      }
+      document.addEventListener('pointerdown', event => {
+        if (!settingsPanel.hidden && !settingsPanel.contains(event.target) && event.target !== settingsButton) {
+          setSettingsOpen(false);
+        }
+      });
+      document.getElementById('windowMinimize').addEventListener('click', () => post({ type: 'minimizeWindow' }));
+      document.getElementById('windowMaximize').addEventListener('click', () => post({ type: 'toggleMaximizeWindow' }));
+      document.getElementById('windowClose').addEventListener('click', () => post({ type: 'closeWindow' }));
+      titleBar.addEventListener('pointerdown', event => {
+        if (event.button !== 0 || event.detail > 1 || isTitlebarInteractive(event.target)) {
+          return;
+        }
+        post({ type: 'dragWindow' });
+      });
+      titleBar.addEventListener('dblclick', event => {
+        if (!isTitlebarInteractive(event.target)) {
+          post({ type: 'toggleMaximizeWindow' });
+        }
+      });
+      let lastNewTabRequest = 0;
+      const requestNewTab = event => {
+        event.preventDefault();
+        event.stopPropagation();
+        const now = Date.now();
+        if (now - lastNewTabRequest < 250) {
+          return;
+        }
+        lastNewTabRequest = now;
+        post({ type: 'newTab' });
+      };
+      newTabButton.addEventListener('pointerdown', requestNewTab, true);
+      newTabButton.addEventListener('mousedown', requestNewTab, true);
+      newTabButton.addEventListener('click', requestNewTab, true);
+      newTabButton.addEventListener('keydown', event => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          requestNewTab(event);
+        }
+      }, true);
+      document.addEventListener('keydown', event => {
+        if (event.ctrlKey && event.shiftKey && event.altKey && shortcutKeyMatches(event, 't')) {
+          stopKeyboardShortcut(event);
+          writeAnsiSelfTest();
+          return;
+        }
+        handleTerminalClipboardShortcut(event, paneFromEventTarget(event.target));
+      }, true);
+    }
+
+    async function bindBackendEvents() {
+      if (backendListenerBound) {
+        return true;
+      }
+      const listen = window.__TAURI__ && window.__TAURI__.event && typeof window.__TAURI__.event.listen === 'function'
+        ? window.__TAURI__.event.listen.bind(window.__TAURI__.event)
+        : null;
+      if (!listen) {
+        throw new Error('Tauri event API unavailable');
+      }
+      await listen('frontend-event', event => {
+        if (window.vibeTerm && event) {
+          window.vibeTerm.receive(event.payload);
+        }
+      });
+      backendListenerBound = true;
+      return true;
+    }
+
+    window.vibeTerm = {
+      receive(event) {
+        switch (event.type) {
+          case 'init':
+            maxPanesPerTab = event.maxPanesPerTab;
+            appVersion = event.appVersion || '';
+            appVersionText.textContent = appVersion || '-';
+            terminalSettings.fontFamily = event.fontFamily || defaultTerminalFont;
+            terminalSettings.fontSize = normalizeFontSize(event.fontSize || defaultTerminalFontSize);
+            syncTerminalFontCss();
+            populateFontSelect(event.fontFamilies);
+            syncSettingsControls();
+            for (const pane of panes.values()) {
+              pane.updateFont();
+            }
+            setStatus('');
+            break;
+          case 'tabCreated':
+            createTab(event);
+            break;
+          case 'tabSelected':
+            selectTab(event.tabId);
+            break;
+          case 'tabClosed':
+            closeTab(event.tabId);
+            break;
+          case 'paneCreated':
+            createPane(event);
+            break;
+          case 'paneSelected':
+            selectPane(event.paneId);
+            break;
+          case 'paneReset':
+            resetPane(event);
+            break;
+          case 'paneClosed':
+            closePane(event.paneId);
+            break;
+          case 'output':
+            writePane(event);
+            break;
+          case 'updateCheckStarted':
+            updateCheckInFlight = true;
+            setUpdateButton('checking', { disabled: true });
+            setUpdateStatus(event.manual ? '正在检查更新...' : '正在自动检查更新...');
+            break;
+          case 'updateAvailable':
+            updateCheckInFlight = false;
+            latestUpdate = event;
+            if (event.assetUrl) {
+              setUpdateButton('install');
+              setUpdateStatus(`发现新版本 ${event.version}，点击“立即更新”开始安装。`, 'success');
+            } else {
+              setUpdateButton('check');
+              setUpdateStatus(`发现新版本 ${event.version}，但没有可自动安装的安装包。`, 'warning');
+            }
+            break;
+          case 'updateNotAvailable':
+            updateCheckInFlight = false;
+            latestUpdate = null;
+            setUpdateButton('check');
+            setUpdateStatus(`已是最新版本 ${event.currentVersion}。`, 'success');
+            break;
+          case 'updateInstallStarted':
+            updateInstallInFlight = true;
+            setUpdateButton('installing', { disabled: true });
+            setUpdateStatus(`正在下载 ${event.version}...`);
+            break;
+          case 'updateInstallLaunched':
+            updateInstallInFlight = false;
+            setUpdateButton('launched', { disabled: true });
+            setUpdateStatus(`安装程序已启动：${event.version}`, 'success');
+            break;
+          case 'updateError':
+            updateCheckInFlight = false;
+            updateInstallInFlight = false;
+            setUpdateButton(latestUpdate && latestUpdate.assetUrl ? 'install' : 'check');
+            setUpdateStatus(event.message || '更新失败。', 'error');
+            break;
+          case 'exit':
+            markExited(event);
+            break;
+          case 'status':
+            setStatus(event.message);
+            break;
+          case 'error':
+            setStatus(event.message);
+            break;
+        }
+      },
+      fitActive() {
+        fitVisiblePanes();
+      },
+    };
+
+    window.addEventListener('resize', () => requestAnimationFrame(fitVisiblePanes));
+
+    function boot() {
+      const missingXtermGlobals = [];
+      if (typeof window.Terminal !== 'function') missingXtermGlobals.push('Terminal');
+      if (!window.FitAddon || typeof window.FitAddon.FitAddon !== 'function') missingXtermGlobals.push('FitAddon');
+      if (!window.CanvasAddon || typeof window.CanvasAddon.CanvasAddon !== 'function') missingXtermGlobals.push('CanvasAddon');
+      if (!window.ClipboardAddon || typeof window.ClipboardAddon.ClipboardAddon !== 'function') missingXtermGlobals.push('ClipboardAddon');
+      if (!window.Unicode11Addon || typeof window.Unicode11Addon.Unicode11Addon !== 'function') missingXtermGlobals.push('Unicode11Addon');
+      if (missingXtermGlobals.length) {
+        setStatus(`xterm.js 加载失败：缺少 ${missingXtermGlobals.join(', ')}`);
+        return;
+      }
+      installXtermAnsiPaletteFallback();
+      bindUi();
+      bindBackendEvents()
+        .then(() => post({ type: 'ready' }))
+        .catch(error => {
+          const message = String(error);
+          setStatus(`连接后端失败：${message}`);
+          if (typeof window.vibeTermInvoke === 'function') {
+            window.vibeTermInvoke({
+              type: 'frontendError',
+              message,
+              stack: error && error.stack ? String(error.stack) : '',
+            }).catch(() => {});
+          }
+        });
+    }
+
+    if (document.readyState === 'loading') {
+      window.addEventListener('DOMContentLoaded', boot);
+    } else {
+      boot();
+    }
+  </script>
+</body>
+</html>
