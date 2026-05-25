@@ -335,12 +335,6 @@
       color: #e06c75;
     }
 
-    .settings-actions {
-      display: flex;
-      justify-content: flex-end;
-      gap: 8px;
-    }
-
     .settings-primary-action {
       width: 100%;
       height: 34px;
@@ -796,9 +790,6 @@
             <span>字号</span>
             <input id="terminalFontSizeInput" type="number" min="10" max="32" step="1" value="14">
           </label>
-          <div class="settings-actions">
-            <button id="resetFontButton" type="button">重置</button>
-          </div>
         </div>
         <div class="settings-column">
           <div class="settings-section">
@@ -957,7 +948,6 @@
     const settingsPanel = document.getElementById('settingsPanel');
     const terminalFontSelect = document.getElementById('terminalFontSelect');
     const terminalFontSizeInput = document.getElementById('terminalFontSizeInput');
-    const resetFontButton = document.getElementById('resetFontButton');
     const appVersionText = document.getElementById('appVersionText');
     const updateStatus = document.getElementById('updateStatus');
     const checkUpdateButton = document.getElementById('checkUpdateButton');
@@ -1801,7 +1791,6 @@
         }
         const repeat = 2;
         const input = scrollInputForWheel(this.term, event).repeat(repeat);
-        setStatus(`wheel -> ${event.deltaY < 0 ? 'up' : 'down'} x${repeat}`);
         post({ type: 'input', paneId: this.id, data: input });
         return false;
       }
@@ -2224,12 +2213,6 @@
       });
       terminalFontSizeInput.addEventListener('change', () => {
         applyTerminalAppearance({ fontSize: terminalFontSizeInput.value });
-      });
-      resetFontButton.addEventListener('click', () => {
-        applyTerminalAppearance({
-          fontFamily: defaultTerminalFont,
-          fontSize: defaultTerminalFontSize,
-        });
       });
       checkUpdateButton.addEventListener('click', handleUpdateButtonClick);
       for (const input of [terminalFontSelect, terminalFontSizeInput]) {

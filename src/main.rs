@@ -383,7 +383,7 @@ fn main() -> Result<()> {
 }
 
 fn run_main_instance(startup_directory: Option<PathBuf>) -> Result<()> {
-    let state = AppState::new(startup_directory);
+    let state = AppState::new(resolve_startup_directory(startup_directory));
     let setup_state = state.clone();
 
     tauri::Builder::default()
@@ -1714,6 +1714,18 @@ fn settings_path() -> Option<PathBuf> {
         env::var_os("HOME")
             .map(PathBuf::from)
             .map(|path| path.join(".config").join("vibeterm").join("settings.json"))
+    }
+}
+
+fn resolve_startup_directory(startup_directory: Option<PathBuf>) -> Option<PathBuf> {
+    startup_directory.or_else(user_home_directory)
+}
+
+fn user_home_directory() -> Option<PathBuf> {
+    if cfg!(windows) {
+        env::var_os("USERPROFILE").map(PathBuf::from)
+    } else {
+        env::var_os("HOME").map(PathBuf::from)
     }
 }
 
