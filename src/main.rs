@@ -1609,6 +1609,7 @@ fn download_and_launch_update(version: &str, asset_url: &str, silent: bool) -> R
     let mut file = fs::File::create(&installer_path).context("failed to create update file")?;
     io::copy(&mut reader, &mut file).context("failed to write update file")?;
     file.flush().ok();
+    drop(file);
 
     let mut command = Command::new(&installer_path);
     if silent {
