@@ -4,7 +4,7 @@ use std::{
     collections::BTreeSet,
     env, fs,
     io::{self, Read, Write},
-    net::{TcpListener, TcpStream},
+    net::{Shutdown, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::Command,
     sync::{Arc, Mutex, MutexGuard},
@@ -12,7 +12,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use arboard::Clipboard;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
@@ -26,6 +26,7 @@ const GITHUB_LATEST_RELEASE_API: &str =
     "https://api.github.com/repos/DarlingCY/VibeTerm/releases/latest";
 const GITHUB_LATEST_RELEASE_PAGE: &str = "https://github.com/DarlingCY/VibeTerm/releases/latest";
 const UPDATE_USER_AGENT: &str = concat!("VibeTerm/", env!("CARGO_PKG_VERSION"));
+const MIN_INSTALLER_BYTES: u64 = 1024 * 1024;
 const DEFAULT_TERMINAL_FONT: &str = "Cascadia Mono, Cascadia Code, Consolas, monospace";
 const DEFAULT_TERMINAL_FONT_SIZE: u16 = 14;
 const MIN_TERMINAL_FONT_SIZE: u16 = 10;
@@ -47,8 +48,6 @@ pub struct CliArgs {
 
 #[derive(Debug, Clone)]
 struct ShellProfile {
-    #[allow(dead_code)]
-    name: String,
     program: String,
     args: Vec<String>,
 }
@@ -397,23 +396,13 @@ fn run_main_instance(startup_directory: Option<PathBuf>) -> Result<()> {
                 WindowEvent::CloseRequested { api, .. } => {
                     api.prevent_close();
                     let state = window.state::<AppState>();
-                    let lock_result = state.runtime.lock();
-                    if let Ok(mut runtime) = lock_result {
-                        runtime.app.shutdown();
-                    }
-                    let app = window.app_handle().clone();
+                    shutdown_runtime(state.inner());
                     let _ = window.hide();
-                    thread::spawn(move || {
-                        thread::sleep(Duration::from_millis(800));
-                        app.exit(0);
-                    });
+                    exit_app_after_delay(window.app_handle().clone());
                 }
                 WindowEvent::Destroyed => {
                     let state = window.state::<AppState>();
-                    let lock_result = state.runtime.lock();
-                    if let Ok(mut runtime) = lock_result {
-                        runtime.app.shutdown();
-                    }
+                    shutdown_runtime(state.inner());
                 }
                 _ => {}
             }
@@ -431,6 +420,19 @@ fn runtime_lock(dispatcher: &AppDispatcher) -> Result<MutexGuard<'_, RuntimeStat
         .map_err(|_| anyhow!("application state lock poisoned"))
 }
 
+fn shutdown_runtime(state: &AppState) {
+    if let Ok(mut runtime) = state.runtime.lock() {
+        runtime.app.shutdown();
+    }
+}
+
+fn exit_app_after_delay(app: AppHandle) {
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(800));
+        app.exit(0);
+    });
+}
+
 fn queue_or_dispatch(runtime: &mut RuntimeState, events: Vec<FrontendEvent>) -> Option<Vec<FrontendEvent>> {
     if events.is_empty() {
         return None;
@@ -442,6 +444,23 @@ fn queue_or_dispatch(runtime: &mut RuntimeState, events: Vec<FrontendEvent>) -> 
         runtime.pending_frontend_events.extend(events);
         None
     }
+}
+
+fn dispatch_runtime_events(
+    dispatcher: &AppDispatcher,
+    build_events: impl FnOnce(&mut RuntimeState) -> Vec<FrontendEvent>,
+) -> Result<()> {
+    let ready_events = {
+        let mut runtime = runtime_lock(dispatcher)?;
+        let events = build_events(&mut runtime);
+        queue_or_dispatch(&mut runtime, events)
+    };
+
+    if let Some(events) = ready_events {
+        emit_frontend_events(dispatcher, events);
+    }
+
+    Ok(())
 }
 
 fn emit_frontend_events(dispatcher: &AppDispatcher, events: Vec<FrontendEvent>) {
@@ -505,25 +524,11 @@ fn handle_app_event(
                 }
             }
             Ok(FrontendMessage::CloseWindow) => {
-                {
-                    let mut runtime = runtime_lock(dispatcher)?;
-                    runtime.app.shutdown();
-                }
-
+                shutdown_runtime(&dispatcher.state);
                 if let Some(window) = window {
                     let _ = window.hide();
-                    let app = dispatcher.app_handle.clone();
-                    thread::spawn(move || {
-                        thread::sleep(Duration::from_millis(800));
-                        app.exit(0);
-                    });
-                } else {
-                    let app = dispatcher.app_handle.clone();
-                    thread::spawn(move || {
-                        thread::sleep(Duration::from_millis(800));
-                        app.exit(0);
-                    });
                 }
+                exit_app_after_delay(dispatcher.app_handle.clone());
             }
             Ok(FrontendMessage::DragWindow) => {
                 if let Some(window) = window {
@@ -531,96 +536,47 @@ fn handle_app_event(
                 }
             }
             Ok(FrontendMessage::ClosePane { pane_id }) => {
-                let ready_events = {
-                    let mut runtime = runtime_lock(dispatcher)?;
-                    let events = runtime.app.close_pane(pane_id);
-                    queue_or_dispatch(&mut runtime, events)
-                };
-
-                if let Some(events) = ready_events {
-                    emit_frontend_events(dispatcher, events);
-                }
+                dispatch_runtime_events(dispatcher, |runtime| runtime.app.close_pane(pane_id))?;
             }
             Ok(message) => {
-                let ready_events = {
-                    let mut runtime = runtime_lock(dispatcher)?;
-                    let events = runtime.app.handle_frontend_message(message, dispatcher.clone());
-                    queue_or_dispatch(&mut runtime, events)
-                };
-
-                if let Some(events) = ready_events {
-                    emit_frontend_events(dispatcher, events);
-                }
+                dispatch_runtime_events(dispatcher, |runtime| {
+                    runtime.app.handle_frontend_message(message, dispatcher.clone())
+                })?;
             }
             Err(error) => {
-                let ready_events = {
-                    let mut runtime = runtime_lock(dispatcher)?;
-                    queue_or_dispatch(
-                        &mut runtime,
-                        vec![FrontendEvent::Error {
-                            message: format!("Invalid frontend message: {error}"),
-                        }],
-                    )
-                };
-
-                if let Some(events) = ready_events {
-                    emit_frontend_events(dispatcher, events);
-                }
+                dispatch_runtime_events(dispatcher, |_| {
+                    vec![FrontendEvent::Error {
+                        message: format!("Invalid frontend message: {error}"),
+                    }]
+                })?;
             }
         },
         AppEvent::FrontendEvents(events) => {
-            let ready_events = {
-                let mut runtime = runtime_lock(dispatcher)?;
-                queue_or_dispatch(&mut runtime, events)
-            };
-
-            if let Some(events) = ready_events {
-                emit_frontend_events(dispatcher, events);
-            }
+            dispatch_runtime_events(dispatcher, |_| events)?;
         }
         AppEvent::Ipc(command) => {
-            let ready_events = {
-                let mut runtime = runtime_lock(dispatcher)?;
-                let events = match command {
+            dispatch_runtime_events(dispatcher, |runtime| {
+                match command {
                     IpcCommand::AddPane { cwd } => runtime.app.add_pane(cwd.map(PathBuf::from)),
                     IpcCommand::NewTab { cwd } => runtime.app.create_tab(cwd.map(PathBuf::from)),
-                };
-                queue_or_dispatch(&mut runtime, events)
-            };
-
-            if let Some(events) = ready_events {
-                emit_frontend_events(dispatcher, events);
-            }
+                }
+            })?;
         }
         AppEvent::PtyOutput {
             pane_id,
             data_base64,
         } => {
-            let ready_events = {
-                let mut runtime = runtime_lock(dispatcher)?;
-                queue_or_dispatch(
-                    &mut runtime,
-                    vec![FrontendEvent::Output {
-                        pane_id,
-                        data_base64,
-                    }],
-                )
-            };
-
-            if let Some(events) = ready_events {
-                emit_frontend_events(dispatcher, events);
-            }
+            dispatch_runtime_events(dispatcher, |_| {
+                vec![FrontendEvent::Output {
+                    pane_id,
+                    data_base64,
+                }]
+            })?;
         }
         AppEvent::PtyExit { pane_id, status } => {
-            let ready_events = {
-                let mut runtime = runtime_lock(dispatcher)?;
-                let events = runtime.app.handle_pty_exit(pane_id, status);
-                queue_or_dispatch(&mut runtime, events)
-            };
-
-            if let Some(events) = ready_events {
-                emit_frontend_events(dispatcher, events);
-            }
+            dispatch_runtime_events(dispatcher, |runtime| {
+                runtime.app.handle_pty_exit(pane_id, status)
+            })?;
         }
     }
 
@@ -1582,14 +1538,20 @@ fn percent_decode(value: &str) -> String {
 
 fn install_update(dispatcher: AppDispatcher, version: String, asset_url: String, silent: bool) {
     thread::spawn(move || {
-        let events = match download_and_launch_update(&version, &asset_url, silent) {
-            Ok(()) => vec![FrontendEvent::UpdateInstallLaunched { version }],
-            Err(error) => vec![FrontendEvent::UpdateError {
+        match download_and_launch_update(&version, &asset_url, silent) {
+            Ok(()) => {
+                dispatch_async_event(
+                    dispatcher.clone(),
+                    AppEvent::FrontendEvents(vec![FrontendEvent::UpdateInstallLaunched { version }]),
+                );
+                thread::sleep(Duration::from_millis(500));
+                shutdown_runtime(&dispatcher.state);
+                exit_app_after_delay(dispatcher.app_handle.clone());
+            }
+            Err(error) => dispatch_async_event(dispatcher, AppEvent::FrontendEvents(vec![FrontendEvent::UpdateError {
                 message: format!("更新安装启动失败: {error}"),
-            }],
-        };
-
-        dispatch_async_event(dispatcher, AppEvent::FrontendEvents(events));
+            }])),
+        }
     });
 }
 
@@ -1600,18 +1562,32 @@ fn download_and_launch_update(version: &str, asset_url: &str, silent: bool) -> R
         "vibeterm-setup-{}-windows-x64.exe",
         sanitize_filename(version)
     ));
+    let download_path = installer_path.with_extension("exe.download");
+    cleanup_old_update_installers(&directory, &installer_path, &download_path);
 
     let response = ureq::get(asset_url)
         .set("User-Agent", UPDATE_USER_AGENT)
         .call()
         .context("failed to download update")?;
+    let status = response.status();
+    if !(200..300).contains(&status) {
+        bail!("failed to download update: HTTP {status}");
+    }
     let mut reader = response.into_reader();
-    let mut file = fs::File::create(&installer_path).context("failed to create update file")?;
-    io::copy(&mut reader, &mut file).context("failed to write update file")?;
+    let mut file = fs::File::create(&download_path).context("failed to create update file")?;
+    let bytes_written = io::copy(&mut reader, &mut file).context("failed to write update file")?;
+    if bytes_written < MIN_INSTALLER_BYTES {
+        bail!("downloaded update file is unexpectedly small ({bytes_written} bytes)");
+    }
     file.flush().ok();
+    file.sync_all().context("failed to flush update file to disk")?;
     drop(file);
+    validate_windows_executable(&download_path)?;
+    let _ = fs::remove_file(&installer_path);
+    fs::rename(&download_path, &installer_path).context("failed to finalize update file")?;
 
     let mut command = Command::new(&installer_path);
+    command.current_dir(&directory);
     if silent {
         command.args([
             "/SILENT",
@@ -1625,6 +1601,37 @@ fn download_and_launch_update(version: &str, asset_url: &str, silent: bool) -> R
         .spawn()
         .with_context(|| format!("failed to launch {}", installer_path.display()))?;
     Ok(())
+}
+
+fn validate_windows_executable(path: &Path) -> Result<()> {
+    let mut file = fs::File::open(path).context("failed to reopen downloaded update file")?;
+    let mut signature = [0u8; 2];
+    file.read_exact(&mut signature)
+        .context("failed to read downloaded update file header")?;
+    if signature != *b"MZ" {
+        bail!("downloaded update file is not a Windows executable");
+    }
+    Ok(())
+}
+
+fn cleanup_old_update_installers(directory: &Path, keep_installer: &Path, keep_download: &Path) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == keep_installer || path == keep_download {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.starts_with("vibeterm-setup-")
+            && (name.ends_with("-windows-x64.exe") || name.ends_with(".exe.download"))
+        {
+            let _ = fs::remove_file(path);
+        }
+    }
 }
 
 fn sanitize_filename(value: &str) -> String {
@@ -1766,36 +1773,29 @@ fn available_shell_profiles() -> Vec<ShellProfile> {
     let mut profiles = Vec::new();
 
     if cfg!(windows) {
-        push_if_available(&mut profiles, "PowerShell 7", "pwsh.exe", ["-NoLogo"]);
-        push_if_available(&mut profiles, "PowerShell", "powershell.exe", ["-NoLogo"]);
-        push_if_available(&mut profiles, "Command Prompt", "cmd.exe", []);
+        push_if_available(&mut profiles, "pwsh.exe", ["-NoLogo"]);
+        push_if_available(&mut profiles, "powershell.exe", ["-NoLogo"]);
+        push_if_available(&mut profiles, "cmd.exe", []);
         push_if_available(
             &mut profiles,
-            "Git Bash",
             r"C:\Program Files\Git\bin\bash.exe",
             ["--login"],
         );
     } else {
         if let Ok(shell) = env::var("SHELL") {
             profiles.push(ShellProfile {
-                name: Path::new(&shell)
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("Shell")
-                    .to_owned(),
                 program: shell,
                 args: Vec::new(),
             });
         }
-        push_if_available(&mut profiles, "bash", "/bin/bash", ["--login"]);
-        push_if_available(&mut profiles, "zsh", "/bin/zsh", ["-l"]);
-        push_if_available(&mut profiles, "fish", "/usr/bin/fish", ["-l"]);
-        push_if_available(&mut profiles, "sh", "/bin/sh", []);
+        push_if_available(&mut profiles, "/bin/bash", ["--login"]);
+        push_if_available(&mut profiles, "/bin/zsh", ["-l"]);
+        push_if_available(&mut profiles, "/usr/bin/fish", ["-l"]);
+        push_if_available(&mut profiles, "/bin/sh", []);
     }
 
     if profiles.is_empty() {
         profiles.push(ShellProfile {
-            name: "Default Shell".to_owned(),
             program: if cfg!(windows) {
                 env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_owned())
             } else {
@@ -1810,13 +1810,11 @@ fn available_shell_profiles() -> Vec<ShellProfile> {
 
 fn push_if_available<const N: usize>(
     profiles: &mut Vec<ShellProfile>,
-    name: &str,
     program: &str,
     args: [&str; N],
 ) {
     if program_available(program) {
         profiles.push(ShellProfile {
-            name: name.to_owned(),
             program: program.to_owned(),
             args: args.into_iter().map(str::to_owned).collect(),
         });
@@ -1844,7 +1842,10 @@ fn send_ipc_command(command: &IpcCommand) -> bool {
         Duration::from_millis(500),
     ) {
         let json = serde_json::to_string(command).unwrap_or_default();
-        return stream.write_all(json.as_bytes()).is_ok();
+        if stream.write_all(json.as_bytes()).is_ok() {
+            let _ = stream.shutdown(Shutdown::Write);
+            return true;
+        }
     }
     false
 }
@@ -1855,29 +1856,28 @@ fn start_ipc_server(dispatcher: AppDispatcher) {
     };
 
     thread::spawn(move || {
-        listener.set_nonblocking(true).ok();
-        loop {
-            match listener.accept() {
-                Ok((mut stream, _)) => {
-                    stream
-                        .set_read_timeout(Some(Duration::from_millis(100)))
-                        .ok();
-                    let mut buf = [0u8; 4096];
-                    if let Ok(n) = stream.read(&mut buf) {
-                        if n > 0 {
-                            if let Ok(text) = std::str::from_utf8(&buf[..n]) {
-                                if let Ok(command) = serde_json::from_str::<IpcCommand>(text) {
-                                    dispatch_async_event(dispatcher.clone(), AppEvent::Ipc(command));
-                                }
-                            }
-                        }
-                    }
+        for stream in listener.incoming() {
+            match stream {
+                Ok(stream) => handle_ipc_stream(stream, &dispatcher),
+                Err(error) => {
+                    eprintln!("IPC server stopped: {error}");
+                    break;
                 }
-                Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(100));
-                }
-                Err(_) => break,
             }
         }
     });
+}
+
+fn handle_ipc_stream(mut stream: TcpStream, dispatcher: &AppDispatcher) {
+    stream
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .ok();
+    let mut text = String::new();
+    if stream.read_to_string(&mut text).is_err() || text.trim().is_empty() {
+        return;
+    }
+    match serde_json::from_str::<IpcCommand>(text.trim()) {
+        Ok(command) => dispatch_async_event(dispatcher.clone(), AppEvent::Ipc(command)),
+        Err(error) => eprintln!("invalid IPC command: {error}"),
+    }
 }

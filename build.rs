@@ -4,6 +4,15 @@ fn main() {
     println!("cargo:rerun-if-changed=tauri.conf.json");
     println!("cargo:rerun-if-changed=capabilities/default.json");
     println!("cargo:rerun-if-changed=ui/index.html");
+    println!("cargo:rerun-if-changed=ui/styles.css");
+    println!("cargo:rerun-if-changed=ui/startup.js");
+    println!("cargo:rerun-if-changed=ui/state.js");
+    println!("cargo:rerun-if-changed=ui/settings.js");
+    println!("cargo:rerun-if-changed=ui/update.js");
+    println!("cargo:rerun-if-changed=ui/xterm-support.js");
+    println!("cargo:rerun-if-changed=ui/pane-view.js");
+    println!("cargo:rerun-if-changed=ui/tabs.js");
+    println!("cargo:rerun-if-changed=ui/app.js");
     println!("cargo:rerun-if-changed=assets/xterm");
     println!("cargo:rerun-if-changed=assets/icon.ico");
     println!("cargo:rerun-if-changed=assets/icon.png");
