@@ -59,6 +59,16 @@
       statusBar.hidden = text.length === 0;
     }
 
+    function syncWindowMaximizeButton(maximized) {
+      const button = document.getElementById('windowMaximize');
+      if (!button) {
+        return;
+      }
+      button.innerHTML = maximized ? '&#xE923;' : '&#xE922;';
+      button.title = maximized ? '还原' : '最大化';
+      button.setAttribute('aria-label', button.title);
+    }
+
     function activePane() {
       return panes.get(activePaneId) || null;
     }
@@ -105,8 +115,8 @@
 
     function panePixelSize(rect) {
       return {
-        pixelWidth: Math.max(1, Math.floor(rect.width)),
-        pixelHeight: Math.max(1, Math.floor(rect.height)),
+        pixelWidth: Math.max(1, Math.ceil(rect.width)),
+        pixelHeight: Math.max(1, Math.ceil(rect.height)),
       };
     }
 
@@ -128,6 +138,11 @@
       } catch (error) {
         return 'none';
       }
+    }
+
+    function terminalHasInteractiveControlMode(term) {
+      const mouseMode = terminalMouseTrackingMode(term);
+      return terminalUsesAlternateScreen(term) || (mouseMode && mouseMode !== 'none');
     }
 
     function wheelLineCount(event) {
@@ -276,6 +291,9 @@
             updateInstallInFlight = false;
             setUpdateButton(latestUpdate && latestUpdate.assetUrl ? 'install' : 'check');
             setUpdateStatus(event.message || '更新失败。', 'error');
+            break;
+          case 'windowState':
+            syncWindowMaximizeButton(Boolean(event.maximized));
             break;
           case 'exit':
             markExited(event);

@@ -21,7 +21,7 @@ use arboard::Clipboard;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow, Window, WindowEvent};
 
 const IPC_PORT: u16 = 15973;
 const IPC_HOST: &str = "127.0.0.1";
@@ -368,6 +368,9 @@ enum FrontendEvent {
     UpdateError {
         message: String,
     },
+    WindowState {
+        maximized: bool,
+    },
     Exit {
         pane_id: u32,
         status: Option<String>,
@@ -488,6 +491,7 @@ fn run_main_instance(startup_directory: Option<PathBuf>) -> Result<()> {
                 let _ = window.hide();
                 exit_app_after_delay(window.app_handle().clone());
             }
+            WindowEvent::Resized(_) => emit_window_state(window),
             WindowEvent::Destroyed => {
                 let state = window.state::<AppState>();
                 shutdown_runtime(state.inner());
@@ -594,6 +598,24 @@ fn emit_frontend_event(dispatcher: &AppDispatcher, event: &FrontendEvent) {
 
     if let Err(error) = window.emit(FRONTEND_EVENT_NAME, event) {
         eprintln!("failed to emit frontend event: {error}");
+    }
+}
+
+fn emit_window_state(window: &Window) {
+    let event = FrontendEvent::WindowState {
+        maximized: window.is_maximized().unwrap_or(false),
+    };
+    if let Err(error) = window.emit(FRONTEND_EVENT_NAME, &event) {
+        eprintln!("failed to emit window state: {error}");
+    }
+}
+
+fn emit_webview_window_state(window: &WebviewWindow) {
+    let event = FrontendEvent::WindowState {
+        maximized: window.is_maximized().unwrap_or(false),
+    };
+    if let Err(error) = window.emit(FRONTEND_EVENT_NAME, &event) {
+        eprintln!("failed to emit window state: {error}");
     }
 }
 
@@ -706,6 +728,9 @@ fn handle_app_event(
                 };
 
                 emit_frontend_events(dispatcher, pending);
+                if let Some(window) = window {
+                    emit_webview_window_state(window);
+                }
             }
             Ok(FrontendMessage::MinimizeWindow) => {
                 if let Some(window) = window {
@@ -720,6 +745,7 @@ fn handle_app_event(
                     } else {
                         window.maximize()
                     };
+                    emit_webview_window_state(window);
                 }
             }
             Ok(FrontendMessage::CloseWindow) => {

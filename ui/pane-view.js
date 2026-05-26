@@ -44,6 +44,10 @@ function makePaneButton(className, title, text, onClick) {
         this.exited = Boolean(event.exited);
         this.selection = '';
         this.cwd = String(event.cwd || '').trim();
+        this.paneIndex = null;
+        this.ansiSequenceTail = '';
+        this.ansiAlternateScreen = false;
+        this.ansiMouseTracking = false;
 
         this.element = document.createElement('section');
         this.element.className = 'pane';
@@ -103,12 +107,16 @@ function makePaneButton(className, title, text, onClick) {
           });
           this.term.loadAddon(this.clipboardAddon);
         }
-        this.term.onData(data => post({ type: 'input', paneId: this.id, data }));
+        this.term.onData(data => this.sendInput(data));
         if (typeof this.term.onSelectionChange === 'function') {
           this.term.onSelectionChange(() => this.syncSelection());
         }
         this.term.attachCustomKeyEventHandler(event => handleTerminalClipboardShortcut(event, this));
         this.terminalElement.addEventListener('mousedown', () => this.focus(true));
+        this.terminalElement.addEventListener('contextmenu', event => {
+          event.preventDefault();
+          event.stopPropagation();
+        }, true);
         this.element.addEventListener('wheel', event => this.handleWheel(event), {
           passive: false,
           capture: true,
@@ -138,6 +146,17 @@ function makePaneButton(className, title, text, onClick) {
         if (this.visible && this.opened) {
           this.flushPendingOutput();
         }
+      }
+
+      sendInput(data) {
+        if (data === '\x03') {
+          return;
+        }
+        post({ type: 'input', paneId: this.id, data });
+      }
+
+      hasInteractiveControlMode() {
+        return this.ansiAlternateScreen || this.ansiMouseTracking || terminalHasInteractiveControlMode(this.term);
       }
 
       openTerminal() {
@@ -222,9 +241,15 @@ function makePaneButton(className, title, text, onClick) {
             }
             return null;
           }
-          const proposed = typeof this.fitAddon.proposeDimensions === 'function'
-            ? this.fitAddon.proposeDimensions()
-            : null;
+          const dimensions = visibleTerminalDimensions(this.term);
+          const proposed = dimensions
+            ? {
+                cols: Math.ceil(rect.width / dimensions.css.cell.width),
+                rows: Math.ceil(rect.height / dimensions.css.cell.height),
+              }
+            : typeof this.fitAddon.proposeDimensions === 'function'
+              ? this.fitAddon.proposeDimensions()
+              : null;
           if (!proposed || !proposed.cols || !proposed.rows) {
             return null;
           }
@@ -384,6 +409,11 @@ function makePaneButton(className, title, text, onClick) {
         this.addButton.style.display = addHidden ? 'none' : '';
       }
 
+      syncLabel(index) {
+        this.paneIndex = index;
+        this.cwdElement.textContent = this.label();
+      }
+
       focus(notify) {
         activePaneId = this.id;
         for (const pane of panes.values()) {
@@ -409,6 +439,9 @@ function makePaneButton(className, title, text, onClick) {
         this.exited = false;
         this.cwd = String((event && event.cwd) || '').trim();
         this.selection = '';
+        this.ansiSequenceTail = '';
+        this.ansiAlternateScreen = false;
+        this.ansiMouseTracking = false;
         this.cwdElement.textContent = this.label();
         this.term.reset();
         this.term.clear();
@@ -416,11 +449,33 @@ function makePaneButton(className, title, text, onClick) {
       }
 
       write(dataBase64) {
+        this.trackTerminalControlSequences(dataBase64);
         if (!this.opened || !this.visible) {
           queuePendingOutput(this.id, dataBase64);
           return;
         }
         this.queueTerminalWrite(dataBase64);
+      }
+
+      trackTerminalControlSequences(dataBase64) {
+        const bytes = bytesFromBase64(dataBase64);
+        if (!bytes.length) {
+          return;
+        }
+        const text = this.ansiSequenceTail + new TextDecoder().decode(bytes);
+        const privateModePattern = /\x1b\[\?([0-9;]*)([hl])/g;
+        let match;
+        while ((match = privateModePattern.exec(text)) !== null) {
+          const enabled = match[2] === 'h';
+          const modes = match[1].split(';').map(value => Number(value));
+          if (modes.some(mode => mode === 1047 || mode === 1048 || mode === 1049)) {
+            this.ansiAlternateScreen = enabled;
+          }
+          if (modes.some(mode => mode === 1000 || mode === 1002 || mode === 1003 || mode === 1005 || mode === 1006 || mode === 1015)) {
+            this.ansiMouseTracking = enabled;
+          }
+        }
+        this.ansiSequenceTail = text.slice(-128);
       }
 
       queueTerminalWrite(dataBase64) {
@@ -493,6 +548,9 @@ function makePaneButton(className, title, text, onClick) {
         this.clearTerminalWriteQueue();
         this.exited = true;
         this.visible = false;
+        this.ansiSequenceTail = '';
+        this.ansiAlternateScreen = false;
+        this.ansiMouseTracking = false;
         this.cwdElement.textContent = this.label();
       }
 
@@ -505,7 +563,7 @@ function makePaneButton(className, title, text, onClick) {
       }
 
       label() {
-        return this.cwd || `Pane#${this.id}`;
+        return `Pane#${this.paneIndex || this.id}`;
       }
 
       updateFont() {

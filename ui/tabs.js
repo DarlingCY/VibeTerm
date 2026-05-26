@@ -77,6 +77,7 @@ function syncTabCloseButtons() {
         const slot = paneLayoutSlot(count, index);
         pane.element.style.gridColumn = `${slot.column} / span 1`;
         pane.element.style.gridRow = `${slot.row} / span ${slot.rowSpan}`;
+        pane.syncLabel(index + 1);
         pane.setActive(count > 1 && pane.id === activePaneId);
         pane.syncControls(count);
       });

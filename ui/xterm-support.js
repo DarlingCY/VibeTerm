@@ -250,20 +250,21 @@ function xtermCssLoaded() {
     }
 
     function handleTerminalClipboardShortcut(event, pane) {
-      if (event.type !== 'keydown' || !event.ctrlKey || !event.shiftKey || event.altKey) {
+      if (event.type !== 'keydown' || !event.ctrlKey || event.altKey) {
         return true;
       }
       if (settingsPanel.contains(event.target)) {
         return true;
       }
+      const targetPane = pane || paneFromEventTarget(event.target);
       if (shortcutKeyMatches(event, 'c')) {
         stopKeyboardShortcut(event);
-        copyPaneSelection(pane || paneFromEventTarget(event.target));
+        copyPaneSelection(targetPane);
         return false;
       }
       if (shortcutKeyMatches(event, 'v')) {
         stopKeyboardShortcut(event);
-        pasteIntoPane(pane || paneFromEventTarget(event.target));
+        pasteIntoPane(targetPane);
         return false;
       }
       return true;
