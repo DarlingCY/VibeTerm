@@ -227,8 +227,17 @@
           case 'output':
             writePane(event);
             break;
+          case 'outputBatch':
+            for (const chunk of event.chunks || []) {
+              writePane(chunk);
+            }
+            break;
           case 'fontFamiliesLoaded':
             applyLoadedFontFamilies(event.fontFamilies);
+            break;
+          case 'diagnostics':
+            setStatus('诊断信息已复制');
+            copyDiagnosticText(event.text || '');
             break;
           case 'updateCheckStarted':
             updateCheckInFlight = true;

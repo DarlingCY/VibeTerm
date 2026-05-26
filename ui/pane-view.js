@@ -26,6 +26,7 @@ function makePaneButton(className, title, text, onClick) {
         this.started = false;
         this.starting = false;
         this.opened = false;
+        this.visible = false;
         this.deferredFitTimer = null;
         this.pendingFitFrame = null;
         this.pendingForceBackendResize = false;
@@ -126,9 +127,17 @@ function makePaneButton(className, title, text, onClick) {
         if (!this.element.isConnected) {
           return;
         }
+        this.setVisible(true);
         this.openTerminal();
         this.flushPendingOutput();
         this.scheduleFitAndStart({ forceBackendResize: true });
+      }
+
+      setVisible(visible) {
+        this.visible = Boolean(visible);
+        if (this.visible && this.opened) {
+          this.flushPendingOutput();
+        }
       }
 
       openTerminal() {
@@ -361,7 +370,6 @@ function makePaneButton(className, title, text, onClick) {
 
       syncSelection() {
         this.selection = this.term.getSelection();
-        post({ type: 'selectionChanged', paneId: this.id, text: this.selection });
       }
 
       syncControls(paneCount) {
@@ -392,24 +400,23 @@ function makePaneButton(className, title, text, onClick) {
         }
       }
 
-      reset() {
+      reset(event) {
         pendingOutput.delete(this.id);
         this.started = false;
         this.starting = false;
         this.clearPaneTimers();
         this.clearTerminalWriteQueue();
         this.exited = false;
-        this.cwd = String(event.cwd || '').trim();
+        this.cwd = String((event && event.cwd) || '').trim();
         this.selection = '';
         this.cwdElement.textContent = this.label();
-        post({ type: 'selectionChanged', paneId: this.id, text: '' });
         this.term.reset();
         this.term.clear();
         this.scheduleFitAndStart();
       }
 
       write(dataBase64) {
-        if (!this.opened) {
+        if (!this.opened || !this.visible) {
           queuePendingOutput(this.id, dataBase64);
           return;
         }
@@ -485,7 +492,16 @@ function makePaneButton(className, title, text, onClick) {
         this.clearPaneTimers();
         this.clearTerminalWriteQueue();
         this.exited = true;
+        this.visible = false;
         this.cwdElement.textContent = this.label();
+      }
+
+      diagnosticsLine() {
+        const buffer = this.term && this.term.buffer && this.term.buffer.normal ? this.term.buffer.normal : null;
+        const normalLength = buffer && typeof buffer.length === 'number' ? buffer.length : 'unknown';
+        const canvasCount = this.terminalElement.querySelectorAll('canvas').length;
+        const spanCount = this.terminalElement.querySelectorAll('.xterm-rows span').length;
+        return `pane#${this.id} tab#${this.tabId} opened=${this.opened} visible=${this.visible} started=${this.started} exited=${this.exited} size=${this.term.cols}x${this.term.rows} scrollback=${normalLength} writeQueueBytes=${this.outputQueueBytes} writeQueueChunks=${this.outputQueue.length} canvas=${canvasCount} spans=${spanCount} cwd=${this.cwd || '~'}`;
       }
 
       label() {

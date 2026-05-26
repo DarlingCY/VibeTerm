@@ -211,6 +211,24 @@ function xtermCssLoaded() {
       return true;
     }
 
+    function collectPerformanceDiagnostics() {
+      const memory = performance && performance.memory
+        ? `jsHeap=${performance.memory.usedJSHeapSize}/${performance.memory.totalJSHeapSize}/${performance.memory.jsHeapSizeLimit}`
+        : 'jsHeap=unavailable';
+      const paneLines = Array.from(panes.values()).map(pane => pane.diagnosticsLine());
+      const text = [
+        `frontend tabs=${tabs.size} panes=${panes.size} activeTab=${activeTabId} activePane=${activePaneId}`,
+        `domNodes=${document.getElementsByTagName('*').length} styles=${document.querySelectorAll('style').length} canvases=${document.querySelectorAll('canvas').length}`,
+        pendingOutputSummary(),
+        memory,
+        ...paneLines,
+      ].join('\n');
+      post({ type: 'diagnostics', frontend: text });
+      copyDiagnosticText(text);
+      setStatus('正在收集诊断信息...');
+      return true;
+    }
+
     function stopKeyboardShortcut(event) {
       event.preventDefault();
       event.stopPropagation();
@@ -313,6 +331,11 @@ function xtermCssLoaded() {
         if (event.ctrlKey && event.shiftKey && event.altKey && shortcutKeyMatches(event, 't')) {
           stopKeyboardShortcut(event);
           writeAnsiSelfTest();
+          return;
+        }
+        if (event.ctrlKey && event.shiftKey && event.altKey && shortcutKeyMatches(event, 'm')) {
+          stopKeyboardShortcut(event);
+          collectPerformanceDiagnostics();
           return;
         }
         handleTerminalClipboardShortcut(event, paneFromEventTarget(event.target));

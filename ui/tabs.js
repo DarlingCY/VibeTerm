@@ -114,6 +114,12 @@ function syncTabCloseButtons() {
         const active = existing.id === tabId;
         existing.button.classList.toggle('active', active);
         existing.content.classList.toggle('active', active);
+        for (const paneId of existing.panes) {
+          const pane = panes.get(paneId);
+          if (pane) {
+            pane.setVisible(active);
+          }
+        }
       }
       layoutTab(tab);
       for (const paneId of tab.panes) {

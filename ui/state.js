@@ -86,3 +86,15 @@ const tabs = new Map();
       const amount = mib >= 1 ? `${mib.toFixed(1)} MiB` : `${Math.ceil(pending.droppedBytes / 1024)} KiB`;
       return `\r\n[VibeTerm dropped ${amount} of buffered output while this pane was inactive]\r\n`;
     }
+
+    function pendingOutputSummary() {
+      let totalBytes = 0;
+      let totalDroppedBytes = 0;
+      const entries = [];
+      for (const [paneId, pending] of pendingOutput.entries()) {
+        totalBytes += pending.bytes || 0;
+        totalDroppedBytes += pending.droppedBytes || 0;
+        entries.push(`pane#${paneId}:bytes=${pending.bytes || 0},dropped=${pending.droppedBytes || 0},chunks=${pending.chunks ? pending.chunks.length : 0}`);
+      }
+      return `pendingOutput panes=${pendingOutput.size} bytes=${totalBytes} dropped=${totalDroppedBytes}${entries.length ? ` [${entries.join('; ')}]` : ''}`;
+    }

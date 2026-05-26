@@ -2,9 +2,13 @@
 
 use std::{
     collections::BTreeSet,
-    env, fs,
+    env,
+    ffi::c_void,
+    fs,
     io::{self, Read, Write},
+    mem::size_of,
     net::{Shutdown, TcpListener, TcpStream},
+    os::windows::io::RawHandle,
     path::{Path, PathBuf},
     process::Command,
     sync::{mpsc, Arc, Mutex, MutexGuard},
@@ -36,6 +40,7 @@ const FRONTEND_EVENT_NAME: &str = "frontend-event";
 const PTY_READ_BUFFER_BYTES: usize = 32 * 1024;
 const PTY_OUTPUT_BATCH_MAX_BYTES: usize = 64 * 1024;
 const PTY_OUTPUT_BATCH_DELAY: Duration = Duration::from_millis(8);
+const MAX_PENDING_FRONTEND_EVENTS: usize = 512;
 
 struct PtyOutputChunk {
     pane_id: u32,
@@ -64,6 +69,9 @@ struct TerminalSession {
     master: Option<Box<dyn MasterPty + Send>>,
     writer: Option<Box<dyn Write + Send>>,
     killer: Option<Box<dyn ChildKiller + Send + Sync>>,
+    #[cfg(windows)]
+    job: Option<WinJob>,
+    process_id: Option<u32>,
     cols: u16,
     rows: u16,
     pixel_width: u16,
@@ -78,6 +86,56 @@ impl Drop for TerminalSession {
         }
         thread::sleep(Duration::from_millis(150));
         self.master.take();
+        #[cfg(windows)]
+        self.job.take();
+    }
+}
+
+#[cfg(windows)]
+struct WinJob {
+    handle: isize,
+}
+
+#[cfg(windows)]
+impl Drop for WinJob {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.handle as _);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn create_process_job(process: Option<RawHandle>) -> Option<WinJob> {
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    let process = process?;
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            return None;
+        }
+        let mut info = std::mem::zeroed::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let configured = SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &mut info as *mut _ as *mut c_void,
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        ) != 0;
+        let assigned = configured && AssignProcessToJobObject(job, process as _) != 0;
+        if assigned {
+            Some(WinJob {
+                handle: job as isize,
+            })
+        } else {
+            windows_sys::Win32::Foundation::CloseHandle(job);
+            None
+        }
     }
 }
 
@@ -177,6 +235,9 @@ enum FrontendMessage {
         font_size: u16,
     },
     LoadFontFamilies,
+    Diagnostics {
+        frontend: String,
+    },
     CheckForUpdates {
         manual: bool,
     },
@@ -274,6 +335,12 @@ enum FrontendEvent {
         pane_id: u32,
         data_base64: String,
     },
+    OutputBatch {
+        chunks: Vec<OutputChunkEvent>,
+    },
+    Diagnostics {
+        text: String,
+    },
     FontFamiliesLoaded {
         font_families: Vec<String>,
     },
@@ -311,6 +378,13 @@ enum FrontendEvent {
     Error {
         message: String,
     },
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OutputChunkEvent {
+    pane_id: u32,
+    data_base64: String,
 }
 
 struct RuntimeState {
@@ -458,7 +532,35 @@ fn queue_or_dispatch(
         Some(events)
     } else {
         runtime.pending_frontend_events.extend(events);
+        cap_pending_frontend_events(&mut runtime.pending_frontend_events);
         None
+    }
+}
+
+fn cap_pending_frontend_events(events: &mut Vec<FrontendEvent>) {
+    if events.len() <= MAX_PENDING_FRONTEND_EVENTS {
+        return;
+    }
+    let excess = events.len() - MAX_PENDING_FRONTEND_EVENTS;
+    let mut dropped = 0usize;
+    events.retain(|event| {
+        if dropped < excess
+            && matches!(
+                event,
+                FrontendEvent::Output { .. }
+                    | FrontendEvent::OutputBatch { .. }
+                    | FrontendEvent::Status { .. }
+            )
+        {
+            dropped += 1;
+            false
+        } else {
+            true
+        }
+    });
+    if events.len() > MAX_PENDING_FRONTEND_EVENTS {
+        let excess = events.len() - MAX_PENDING_FRONTEND_EVENTS;
+        events.drain(0..excess);
     }
 }
 
@@ -534,16 +636,19 @@ fn start_output_batcher(dispatcher: AppDispatcher) {
                 }
             }
 
-            let events = batches
+            let chunks = batches
                 .into_iter()
                 .filter(|chunk| !chunk.data.is_empty())
-                .map(|chunk| FrontendEvent::Output {
+                .map(|chunk| OutputChunkEvent {
                     pane_id: chunk.pane_id,
                     data_base64: STANDARD.encode(chunk.data),
                 })
                 .collect::<Vec<_>>();
-            if !events.is_empty() {
-                dispatch_async_event(dispatcher.clone(), AppEvent::FrontendEvents(events));
+            if !chunks.is_empty() {
+                dispatch_async_event(
+                    dispatcher.clone(),
+                    AppEvent::FrontendEvents(vec![FrontendEvent::OutputBatch { chunks }]),
+                );
             }
         }
     });
@@ -749,6 +854,9 @@ impl VibeTerm {
                 load_font_families(dispatcher);
                 Vec::new()
             }
+            FrontendMessage::Diagnostics { frontend } => vec![FrontendEvent::Diagnostics {
+                text: self.diagnostics_text(&frontend),
+            }],
             FrontendMessage::CheckForUpdates { manual } => {
                 check_for_updates(dispatcher, manual);
                 vec![FrontendEvent::UpdateCheckStarted { manual }]
@@ -948,6 +1056,64 @@ impl VibeTerm {
         if let Some(pane) = self.find_pane_mut(pane_id) {
             pane.selection = text;
         }
+    }
+
+    fn diagnostics_text(&self, frontend: &str) -> String {
+        let mut lines = vec![
+            format!("VibeTerm {} diagnostics", env!("CARGO_PKG_VERSION")),
+            format!(
+                "tabs={} activeTabIndex={}",
+                self.tabs.len(),
+                self.active_tab
+            ),
+        ];
+        let mut pane_count = 0usize;
+        let mut terminal_count = 0usize;
+        for tab in &self.tabs {
+            lines.push(format!(
+                "tab#{} panes={} activePaneIndex={}",
+                tab.id,
+                tab.panes.len(),
+                tab.active_pane
+            ));
+            for pane in &tab.panes {
+                pane_count += 1;
+                if pane.terminal.is_some() {
+                    terminal_count += 1;
+                }
+                let cwd = pane
+                    .cwd
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "~".to_owned());
+                let process = pane
+                    .terminal
+                    .as_ref()
+                    .and_then(|terminal| terminal.process_id);
+                lines.push(format!(
+                    "  pane#{} terminal={} exited={} process={:?} size={}x{} px={}x{} selectionBytes={} cwd={}",
+                    pane.id,
+                    pane.terminal.is_some(),
+                    pane.exited,
+                    process,
+                    pane.requested_cols,
+                    pane.requested_rows,
+                    pane.requested_pixel_width,
+                    pane.requested_pixel_height,
+                    pane.selection.len(),
+                    cwd,
+                ));
+            }
+        }
+        lines.insert(
+            2,
+            format!("panes={} terminals={}", pane_count, terminal_count),
+        );
+        if !frontend.trim().is_empty() {
+            lines.push("--- frontend ---".to_owned());
+            lines.push(frontend.trim().to_owned());
+        }
+        lines.join("\n")
     }
 
     fn paste_from_clipboard(&mut self, pane_id: u32) -> Vec<FrontendEvent> {
@@ -1254,6 +1420,9 @@ fn spawn_terminal_session(
         .slave
         .spawn_command(command)
         .context("failed to spawn shell")?;
+    let process_id = child.process_id();
+    #[cfg(windows)]
+    let job = create_process_job(child.as_raw_handle());
     let killer = child.clone_killer();
     let mut reader = pair
         .master
@@ -1293,6 +1462,9 @@ fn spawn_terminal_session(
         master: Some(master),
         writer: Some(writer),
         killer: Some(killer),
+        #[cfg(windows)]
+        job,
+        process_id,
         cols,
         rows,
         pixel_width,
