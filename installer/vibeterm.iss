@@ -36,7 +36,7 @@ OutputBaseFilename=vibeterm-setup-{#MyAppVersion}-windows-x64
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
-Name: "contextmenu"; Description: "Add Explorer context menu entry"; GroupDescription: "Explorer integration:"; Flags: unchecked
+Name: "contextmenu"; Description: "Add Explorer context menu entry"; GroupDescription: "Explorer integration:"
 
 [Files]
 Source: "{#MySourceDir}\target\release\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion

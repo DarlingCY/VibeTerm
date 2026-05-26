@@ -28,11 +28,16 @@ $menuSpecs = @(
 )
 
 $parentRoots = @(
-    "HKCU:\Software\Classes\Directory\Background\shell",
-    "HKCU:\Software\Classes\Directory\shell"
+    @{ Path = "HKCU:\Software\Classes\Directory\Background\shell"; CwdArg = "%V" },
+    @{ Path = "HKCU:\Software\Classes\Directory\shell"; CwdArg = "%1" },
+    @{ Path = "HKCU:\Software\Classes\Folder\shell"; CwdArg = "%1" },
+    @{ Path = "HKCU:\Software\Classes\Drive\shell"; CwdArg = "%1" },
+    @{ Path = "HKCU:\Software\Classes\DesktopBackground\shell"; CwdArg = "%V" }
 )
 
-foreach ($root in $parentRoots) {
+foreach ($rootSpec in $parentRoots) {
+    $root = $rootSpec.Path
+    $cwdArg = $rootSpec.CwdArg
     foreach ($spec in $menuSpecs) {
         $key = Join-Path $root $spec.KeyName
 
@@ -47,7 +52,7 @@ foreach ($root in $parentRoots) {
 
         $commandKey = Join-Path $key "command"
         New-Item -Path $commandKey -Force | Out-Null
-        $command = '"{0}" --cwd "%V" --action {1}' -f $ExePath, $spec.Action
+        $command = '"{0}" --cwd "{1}" --action {2}' -f $ExePath, $cwdArg, $spec.Action
         Set-ItemProperty -Path $commandKey -Name "(default)" -Value $command
     }
 }

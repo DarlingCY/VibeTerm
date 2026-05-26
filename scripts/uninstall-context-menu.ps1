@@ -10,7 +10,13 @@ $keys = @(
     "HKCU:\Software\Classes\Directory\Background\shell\VibeTermAddPane",
     "HKCU:\Software\Classes\Directory\Background\shell\VibeTermNewTab",
     "HKCU:\Software\Classes\Directory\shell\VibeTermAddPane",
-    "HKCU:\Software\Classes\Directory\shell\VibeTermNewTab"
+    "HKCU:\Software\Classes\Directory\shell\VibeTermNewTab",
+    "HKCU:\Software\Classes\Folder\shell\VibeTermAddPane",
+    "HKCU:\Software\Classes\Folder\shell\VibeTermNewTab",
+    "HKCU:\Software\Classes\Drive\shell\VibeTermAddPane",
+    "HKCU:\Software\Classes\Drive\shell\VibeTermNewTab",
+    "HKCU:\Software\Classes\DesktopBackground\shell\VibeTermAddPane",
+    "HKCU:\Software\Classes\DesktopBackground\shell\VibeTermNewTab"
 )
 
 foreach ($key in $keys) {
