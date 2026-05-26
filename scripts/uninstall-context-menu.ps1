@@ -25,4 +25,15 @@ foreach ($key in $keys) {
     }
 }
 
+$doubleClickShellRoots = @(
+    "HKCU:\Software\Classes\Directory\shell",
+    "HKCU:\Software\Classes\Folder\shell",
+    "HKCU:\Software\Classes\Drive\shell"
+)
+
+foreach ($root in $doubleClickShellRoots) {
+    New-Item -Path $root -Force | Out-Null
+    Set-Item -LiteralPath $root -Value "none"
+}
+
 Write-Host "Removed Windows context menu for VibeTerm"

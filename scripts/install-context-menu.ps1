@@ -30,10 +30,31 @@ $menuSpecs = @(
 $parentRoots = @(
     @{ Path = "HKCU:\Software\Classes\Directory\Background\shell"; CwdArg = "%V" },
     @{ Path = "HKCU:\Software\Classes\Directory\shell"; CwdArg = "%1" },
-    @{ Path = "HKCU:\Software\Classes\Folder\shell"; CwdArg = "%1" },
     @{ Path = "HKCU:\Software\Classes\Drive\shell"; CwdArg = "%1" },
     @{ Path = "HKCU:\Software\Classes\DesktopBackground\shell"; CwdArg = "%V" }
 )
+
+$legacyKeys = @(
+    "HKCU:\Software\Classes\Folder\shell\VibeTermAddPane",
+    "HKCU:\Software\Classes\Folder\shell\VibeTermNewTab"
+)
+
+foreach ($key in $legacyKeys) {
+    if (Test-Path -LiteralPath $key) {
+        Remove-Item -LiteralPath $key -Recurse -Force
+    }
+}
+
+$doubleClickShellRoots = @(
+    "HKCU:\Software\Classes\Directory\shell",
+    "HKCU:\Software\Classes\Folder\shell",
+    "HKCU:\Software\Classes\Drive\shell"
+)
+
+foreach ($root in $doubleClickShellRoots) {
+    New-Item -Path $root -Force | Out-Null
+    Set-Item -LiteralPath $root -Value "none"
+}
 
 foreach ($rootSpec in $parentRoots) {
     $root = $rootSpec.Path
@@ -53,7 +74,7 @@ foreach ($rootSpec in $parentRoots) {
         $commandKey = Join-Path $key "command"
         New-Item -Path $commandKey -Force | Out-Null
         $command = '"{0}" --cwd "{1}" --action {2}' -f $ExePath, $cwdArg, $spec.Action
-        Set-ItemProperty -Path $commandKey -Name "(default)" -Value $command
+        Set-Item -LiteralPath $commandKey -Value $command
     }
 }
 
