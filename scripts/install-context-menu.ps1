@@ -17,12 +17,12 @@ $ExePath = (Resolve-Path -LiteralPath $ExePath).Path
 $menuSpecs = @(
     @{
         KeyName = "VibeTermAddPane"
-        Label = "VibeTerm：添加到当前 Tab（追加 Pane）"
+        Label = "VibeTerm: Add Pane Here"
         Action = "add-pane"
     },
     @{
         KeyName = "VibeTermNewTab"
-        Label = "VibeTerm：新开 Tab 和 Pane"
+        Label = "VibeTerm: New Tab Here"
         Action = "new-tab"
     }
 )
@@ -73,6 +73,6 @@ namespace VibeTerm {
 [VibeTerm.NativeMethods]::SHChangeNotify(0x08000000, 0, [IntPtr]::Zero, [IntPtr]::Zero)
 
 Write-Host "Installed Windows context menu for VibeTerm:"
-Write-Host "  - VibeTerm：添加到当前 Tab（追加 Pane）"
-Write-Host "  - VibeTerm：新开 Tab 和 Pane"
+Write-Host "  - VibeTerm: Add Pane Here"
+Write-Host "  - VibeTerm: New Tab Here"
 Write-Host "Executable: $ExePath"
