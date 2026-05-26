@@ -48,8 +48,13 @@ jobs:
           & iscc.exe "/DMyAppVersion=$env:APP_VERSION" "/DMySourceDir=${{ github.workspace }}" "/DMyOutputDir=${{ github.workspace }}\dist" "installer\vibeterm.iss"
 
       - name: Publish GitHub release assets
-        uses: softprops/action-gh-release@v2
-        with:
-          generate_release_notes: true
-          files: |
-            dist\*.exe
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $asset = Get-ChildItem -Path "dist" -Filter "*.exe" | Select-Object -First 1
+          if (-not $asset) {
+            throw "No installer asset found in dist"
+          }
+          gh release create $tag $asset.FullName --title $tag --generate-notes --verify-tag
