@@ -57,6 +57,21 @@ foreach ($rootSpec in $parentRoots) {
     }
 }
 
+if (-not ([System.Management.Automation.PSTypeName]'VibeTerm.NativeMethods').Type) {
+    Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+
+namespace VibeTerm {
+    public static class NativeMethods {
+        [DllImport("shell32.dll")]
+        public static extern void SHChangeNotify(int wEventId, uint uFlags, IntPtr dwItem1, IntPtr dwItem2);
+    }
+}
+"@
+}
+[VibeTerm.NativeMethods]::SHChangeNotify(0x08000000, 0, [IntPtr]::Zero, [IntPtr]::Zero)
+
 Write-Host "Installed Windows context menu for VibeTerm:"
 Write-Host "  - VibeTerm：添加到当前 Tab（追加 Pane）"
 Write-Host "  - VibeTerm：新开 Tab 和 Pane"
