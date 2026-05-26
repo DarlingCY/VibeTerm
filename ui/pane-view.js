@@ -37,6 +37,8 @@ function makePaneButton(className, title, text, onClick) {
         this.outputQueueBytes = 0;
         this.outputFlushTimer = null;
         this.outputWriteInFlight = false;
+        this.pendingReplayChunks = [];
+        this.pendingReplayFrame = null;
         this.lastFitCols = 0;
         this.lastFitRows = 0;
         this.lastFitPixelWidth = 0;
@@ -48,6 +50,7 @@ function makePaneButton(className, title, text, onClick) {
         this.ansiSequenceTail = '';
         this.ansiAlternateScreen = false;
         this.ansiMouseTracking = false;
+        this.ansiDecoder = new TextDecoder();
 
         this.element = document.createElement('section');
         this.element.className = 'pane';
@@ -198,32 +201,7 @@ function makePaneButton(className, title, text, onClick) {
       }
 
       scheduleFitAndStart({ forceBackendResize = false } = {}) {
-        this.pendingForceBackendResize = this.pendingForceBackendResize || forceBackendResize;
-        this.clearPendingFitFrame();
-        const runFitAndStart = () => {
-          const shouldForceBackendResize = this.pendingForceBackendResize;
-          const size = this.fit({ forceBackendResize: shouldForceBackendResize });
-          if (size || !shouldForceBackendResize) {
-            this.pendingForceBackendResize = false;
-          }
-          this.ensureStarted();
-        };
-        const scheduleFrame = framesRemaining => {
-          this.pendingFitFrame = requestAnimationFrame(() => {
-            if (framesRemaining > 1) {
-              scheduleFrame(framesRemaining - 1);
-              return;
-            }
-            this.pendingFitFrame = null;
-            runFitAndStart();
-          });
-        };
-        scheduleFrame(3);
-        this.clearDeferredFitTimer();
-        this.deferredFitTimer = setTimeout(() => {
-          this.deferredFitTimer = null;
-          runFitAndStart();
-        }, 160);
+        schedulePaneFit(this, { forceBackendResize, ensureStarted: true });
       }
 
       fit({ forceBackendResize = false } = {}) {
@@ -345,10 +323,8 @@ function makePaneButton(className, title, text, onClick) {
       }
 
       clearPendingFitFrame() {
-        if (this.pendingFitFrame !== null) {
-          cancelAnimationFrame(this.pendingFitFrame);
-          this.pendingFitFrame = null;
-        }
+        cancelScheduledPaneFit(this.id);
+        this.pendingFitFrame = null;
       }
 
       clearPostStartResize() {
@@ -379,6 +355,11 @@ function makePaneButton(className, title, text, onClick) {
 
       clearTerminalWriteQueue() {
         this.clearOutputFlushTimer();
+        if (this.pendingReplayFrame !== null) {
+          cancelAnimationFrame(this.pendingReplayFrame);
+          this.pendingReplayFrame = null;
+        }
+        this.pendingReplayChunks = [];
         this.outputQueue = [];
         this.outputQueueBytes = 0;
         this.outputWriteInFlight = false;
@@ -449,11 +430,11 @@ function makePaneButton(className, title, text, onClick) {
       }
 
       write(dataBase64) {
-        this.trackTerminalControlSequences(dataBase64);
         if (!this.opened || !this.visible) {
           queuePendingOutput(this.id, dataBase64);
           return;
         }
+        this.trackTerminalControlSequences(dataBase64);
         this.queueTerminalWrite(dataBase64);
       }
 
@@ -462,7 +443,7 @@ function makePaneButton(className, title, text, onClick) {
         if (!bytes.length) {
           return;
         }
-        const text = this.ansiSequenceTail + new TextDecoder().decode(bytes);
+        const text = this.ansiSequenceTail + this.ansiDecoder.decode(bytes);
         const privateModePattern = /\x1b\[\?([0-9;]*)([hl])/g;
         let match;
         while ((match = privateModePattern.exec(text)) !== null) {
@@ -536,8 +517,34 @@ function makePaneButton(className, title, text, onClick) {
         if (droppedMessage) {
           this.term.write(droppedMessage);
         }
-        for (const chunk of pending.chunks) {
+        if (pending.chunks && pending.chunks.length > 0) {
+          this.pendingReplayChunks.push(...pending.chunks);
+          this.schedulePendingReplay();
+        }
+      }
+
+      schedulePendingReplay() {
+        if (this.pendingReplayFrame !== null || this.pendingReplayChunks.length === 0) {
+          return;
+        }
+        this.pendingReplayFrame = requestAnimationFrame(() => {
+          this.pendingReplayFrame = null;
+          this.replayPendingOutputBatch();
+        });
+      }
+
+      replayPendingOutputBatch() {
+        if (!this.opened || !this.visible || this.pendingReplayChunks.length === 0) {
+          return;
+        }
+        let replayedBytes = 0;
+        while (this.pendingReplayChunks.length > 0 && replayedBytes < terminalWriteBatchMaxBytes) {
+          const chunk = this.pendingReplayChunks.shift();
+          replayedBytes += estimatedDecodedByteLength(chunk);
           this.write(chunk);
+        }
+        if (this.pendingReplayChunks.length > 0) {
+          this.schedulePendingReplay();
         }
       }
 

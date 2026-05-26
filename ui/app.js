@@ -311,7 +311,7 @@
       },
     };
 
-    window.addEventListener('resize', () => requestAnimationFrame(fitVisiblePanes));
+    window.addEventListener('resize', () => scheduleVisiblePaneFits());
 
     function boot() {
       const missingXtermGlobals = [];
@@ -324,7 +324,6 @@
         setStatus(`xterm.js 加载失败：缺少 ${missingXtermGlobals.join(', ')}`);
         return;
       }
-      installXtermAnsiPaletteFallback();
       bindUi();
       bindBackendEvents()
         .then(() => post({ type: 'ready' }))

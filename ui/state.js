@@ -1,12 +1,16 @@
 const tabs = new Map();
     const panes = new Map();
     const pendingOutput = new Map();
-    const pendingOutputMaxBytes = 2 * 1024 * 1024;
+    const pendingOutputMaxBytes = 1 * 1024 * 1024;
+    const pendingOutputGlobalMaxBytes = 3 * 1024 * 1024;
     const terminalWriteBatchDelayMs = 8;
     const terminalWriteBatchMaxBytes = 64 * 1024;
     const enableXtermDomColorNormalization = false;
     const fallbackCols = 120;
     const fallbackRows = 30;
+    const pendingPaneFits = new Map();
+    let pendingPaneFitFrame = null;
+    let pendingPaneFitTimer = null;
     let activeTabId = null;
     let activePaneId = null;
     let maxPanesPerTab = 6;
@@ -70,6 +74,35 @@ const tabs = new Map();
         pending.bytes = Math.max(0, pending.bytes - droppedBytes);
         pending.droppedBytes += droppedBytes;
       }
+      capPendingOutputGlobal();
+    }
+
+    function capPendingOutputGlobal() {
+      let totalBytes = 0;
+      for (const pending of pendingOutput.values()) {
+        totalBytes += pending.bytes || 0;
+      }
+      while (totalBytes > pendingOutputGlobalMaxBytes) {
+        let droppedAny = false;
+        for (const [paneId, pending] of pendingOutput.entries()) {
+          if (!pending.chunks || pending.chunks.length === 0) {
+            if ((pending.bytes || 0) <= 0) {
+              pendingOutput.delete(paneId);
+            }
+            continue;
+          }
+          const dropped = pending.chunks.shift();
+          const droppedBytes = estimatedDecodedByteLength(dropped);
+          pending.bytes = Math.max(0, pending.bytes - droppedBytes);
+          pending.droppedBytes += droppedBytes;
+          totalBytes = Math.max(0, totalBytes - droppedBytes);
+          droppedAny = true;
+          break;
+        }
+        if (!droppedAny) {
+          break;
+        }
+      }
     }
 
     function takePendingOutput(paneId) {
@@ -97,4 +130,58 @@ const tabs = new Map();
         entries.push(`pane#${paneId}:bytes=${pending.bytes || 0},dropped=${pending.droppedBytes || 0},chunks=${pending.chunks ? pending.chunks.length : 0}`);
       }
       return `pendingOutput panes=${pendingOutput.size} bytes=${totalBytes} dropped=${totalDroppedBytes}${entries.length ? ` [${entries.join('; ')}]` : ''}`;
+    }
+
+    function runScheduledPaneFits() {
+      pendingPaneFitFrame = null;
+      if (pendingPaneFitTimer !== null) {
+        clearTimeout(pendingPaneFitTimer);
+        pendingPaneFitTimer = null;
+      }
+      const fits = Array.from(pendingPaneFits.values());
+      pendingPaneFits.clear();
+      for (const item of fits) {
+        const pane = item.pane;
+        if (!pane || pane.exited || !pane.visible) {
+          continue;
+        }
+        const size = pane.fit({ forceBackendResize: item.forceBackendResize });
+        if (item.ensureStarted && (size || !item.forceBackendResize)) {
+          pane.ensureStarted();
+        }
+      }
+    }
+
+    function schedulePaneFit(pane, { forceBackendResize = false, ensureStarted = true } = {}) {
+      if (!pane) {
+        return;
+      }
+      const existing = pendingPaneFits.get(pane.id);
+      pendingPaneFits.set(pane.id, {
+        pane,
+        forceBackendResize: forceBackendResize || Boolean(existing && existing.forceBackendResize),
+        ensureStarted: ensureStarted || Boolean(existing && existing.ensureStarted),
+      });
+      if (pendingPaneFitFrame === null) {
+        pendingPaneFitFrame = requestAnimationFrame(() => {
+          pendingPaneFitFrame = requestAnimationFrame(runScheduledPaneFits);
+        });
+      }
+      if (pendingPaneFitTimer === null) {
+        pendingPaneFitTimer = setTimeout(runScheduledPaneFits, 160);
+      }
+    }
+
+    function scheduleVisiblePaneFits({ forceBackendResize = false, ensureStarted = true } = {}) {
+      const tab = tabs.get(activeTabId);
+      if (!tab) {
+        return;
+      }
+      for (const paneId of tab.panes) {
+        schedulePaneFit(panes.get(paneId), { forceBackendResize, ensureStarted });
+      }
+    }
+
+    function cancelScheduledPaneFit(paneId) {
+      pendingPaneFits.delete(paneId);
     }

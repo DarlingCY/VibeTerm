@@ -399,7 +399,7 @@ struct RuntimeState {
 #[derive(Clone)]
 struct AppState {
     runtime: Arc<Mutex<RuntimeState>>,
-    output_tx: Arc<Mutex<Option<mpsc::Sender<PtyOutputChunk>>>>,
+    output_tx: Arc<Mutex<Option<mpsc::SyncSender<PtyOutputChunk>>>>,
 }
 
 impl AppState {
@@ -626,7 +626,7 @@ fn dispatch_async_event(dispatcher: AppDispatcher, event: AppEvent) {
 }
 
 fn start_output_batcher(dispatcher: AppDispatcher) {
-    let (tx, rx) = mpsc::channel::<PtyOutputChunk>();
+    let (tx, rx) = mpsc::sync_channel::<PtyOutputChunk>(256);
     if let Ok(mut output_tx) = dispatcher.state.output_tx.lock() {
         *output_tx = Some(tx);
     }

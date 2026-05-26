@@ -83,26 +83,12 @@ function syncTabCloseButtons() {
       });
 
       if (tab.id === activeTabId) {
-        requestAnimationFrame(() => {
-          for (const pane of views) {
-            pane.scheduleFitAndStart();
-          }
-        });
+        scheduleVisiblePaneFits();
       }
     }
 
     function fitVisiblePanes() {
-      const tab = tabs.get(activeTabId);
-      if (!tab) {
-        return;
-      }
-      for (const paneId of tab.panes) {
-        const pane = panes.get(paneId);
-        if (pane) {
-          pane.fit();
-          pane.ensureStarted();
-        }
-      }
+      scheduleVisiblePaneFits();
     }
 
     function selectTab(tabId) {
