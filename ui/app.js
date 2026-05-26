@@ -15,7 +15,7 @@
           backend: 'conpty',
           buildNumber: 19044,
         },
-        scrollback: 10000,
+        scrollback: 2000,
         scrollbarWidth: 0,
         theme: {
           background: '#0b0e14',
@@ -70,6 +70,19 @@
         bytes[i] = binary.charCodeAt(i);
       }
       return bytes;
+    }
+
+    function concatenateBytes(chunks, totalBytes) {
+      if (chunks.length === 1) {
+        return chunks[0];
+      }
+      const combined = new Uint8Array(totalBytes);
+      let offset = 0;
+      for (const chunk of chunks) {
+        combined.set(chunk, offset);
+        offset += chunk.length;
+      }
+      return combined;
     }
 
     function terminalFontsReady() {
@@ -213,6 +226,9 @@
             break;
           case 'output':
             writePane(event);
+            break;
+          case 'fontFamiliesLoaded':
+            applyLoadedFontFamilies(event.fontFamilies);
             break;
           case 'updateCheckStarted':
             updateCheckInFlight = true;

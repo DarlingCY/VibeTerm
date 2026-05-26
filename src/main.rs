@@ -7,9 +7,9 @@ use std::{
     net::{Shutdown, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::Command,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{mpsc, Arc, Mutex, MutexGuard},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -33,6 +33,14 @@ const MIN_TERMINAL_FONT_SIZE: u16 = 10;
 const MAX_TERMINAL_FONT_SIZE: u16 = 32;
 const MAX_PANES_PER_TAB: usize = 6;
 const FRONTEND_EVENT_NAME: &str = "frontend-event";
+const PTY_READ_BUFFER_BYTES: usize = 32 * 1024;
+const PTY_OUTPUT_BATCH_MAX_BYTES: usize = 64 * 1024;
+const PTY_OUTPUT_BATCH_DELAY: Duration = Duration::from_millis(8);
+
+struct PtyOutputChunk {
+    pane_id: u32,
+    data: Vec<u8>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum IpcCommand {
@@ -114,7 +122,6 @@ struct VibeTerm {
     shell_profiles: Vec<ShellProfile>,
     active_shell: usize,
     settings: TerminalSettings,
-    font_families: Vec<String>,
     startup_directory: Option<PathBuf>,
     next_tab_id: u32,
     next_pane_id: u32,
@@ -169,6 +176,7 @@ enum FrontendMessage {
         font_family: String,
         font_size: u16,
     },
+    LoadFontFamilies,
     CheckForUpdates {
         manual: bool,
     },
@@ -266,6 +274,9 @@ enum FrontendEvent {
         pane_id: u32,
         data_base64: String,
     },
+    FontFamiliesLoaded {
+        font_families: Vec<String>,
+    },
     UpdateCheckStarted {
         manual: bool,
     },
@@ -311,6 +322,7 @@ struct RuntimeState {
 #[derive(Clone)]
 struct AppState {
     runtime: Arc<Mutex<RuntimeState>>,
+    output_tx: Arc<Mutex<Option<mpsc::Sender<PtyOutputChunk>>>>,
 }
 
 impl AppState {
@@ -321,6 +333,7 @@ impl AppState {
                 frontend_ready: false,
                 pending_frontend_events: Vec::new(),
             })),
+            output_tx: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -388,24 +401,24 @@ fn run_main_instance(startup_directory: Option<PathBuf>) -> Result<()> {
     tauri::Builder::default()
         .manage(state)
         .setup(move |app| {
-            start_ipc_server(AppDispatcher::new(app.handle().clone(), setup_state.clone()));
+            let dispatcher = AppDispatcher::new(app.handle().clone(), setup_state.clone());
+            start_output_batcher(dispatcher.clone());
+            start_ipc_server(dispatcher);
             Ok(())
         })
-        .on_window_event(|window, event| {
-            match event {
-                WindowEvent::CloseRequested { api, .. } => {
-                    api.prevent_close();
-                    let state = window.state::<AppState>();
-                    shutdown_runtime(state.inner());
-                    let _ = window.hide();
-                    exit_app_after_delay(window.app_handle().clone());
-                }
-                WindowEvent::Destroyed => {
-                    let state = window.state::<AppState>();
-                    shutdown_runtime(state.inner());
-                }
-                _ => {}
+        .on_window_event(|window, event| match event {
+            WindowEvent::CloseRequested { api, .. } => {
+                api.prevent_close();
+                let state = window.state::<AppState>();
+                shutdown_runtime(state.inner());
+                let _ = window.hide();
+                exit_app_after_delay(window.app_handle().clone());
             }
+            WindowEvent::Destroyed => {
+                let state = window.state::<AppState>();
+                shutdown_runtime(state.inner());
+            }
+            _ => {}
         })
         .invoke_handler(tauri::generate_handler![frontend_message])
         .run(tauri::generate_context!())
@@ -433,7 +446,10 @@ fn exit_app_after_delay(app: AppHandle) {
     });
 }
 
-fn queue_or_dispatch(runtime: &mut RuntimeState, events: Vec<FrontendEvent>) -> Option<Vec<FrontendEvent>> {
+fn queue_or_dispatch(
+    runtime: &mut RuntimeState,
+    events: Vec<FrontendEvent>,
+) -> Option<Vec<FrontendEvent>> {
     if events.is_empty() {
         return None;
     }
@@ -483,6 +499,84 @@ fn dispatch_async_event(dispatcher: AppDispatcher, event: AppEvent) {
     if let Err(error) = handle_app_event(&dispatcher, None, event) {
         eprintln!("failed to dispatch async backend event: {error:#}");
     }
+}
+
+fn start_output_batcher(dispatcher: AppDispatcher) {
+    let (tx, rx) = mpsc::channel::<PtyOutputChunk>();
+    if let Ok(mut output_tx) = dispatcher.state.output_tx.lock() {
+        *output_tx = Some(tx);
+    }
+
+    thread::spawn(move || {
+        while let Ok(first) = rx.recv() {
+            let mut batches: Vec<PtyOutputChunk> = vec![first];
+            let mut total_bytes = batches[0].data.len();
+            let deadline = Instant::now() + PTY_OUTPUT_BATCH_DELAY;
+
+            while total_bytes < PTY_OUTPUT_BATCH_MAX_BYTES {
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                match rx.recv_timeout(deadline.saturating_duration_since(now)) {
+                    Ok(chunk) => {
+                        total_bytes += chunk.data.len();
+                        if let Some(last) = batches.last_mut() {
+                            if last.pane_id == chunk.pane_id {
+                                last.data.extend_from_slice(&chunk.data);
+                                continue;
+                            }
+                        }
+                        batches.push(chunk);
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => break,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                }
+            }
+
+            let events = batches
+                .into_iter()
+                .filter(|chunk| !chunk.data.is_empty())
+                .map(|chunk| FrontendEvent::Output {
+                    pane_id: chunk.pane_id,
+                    data_base64: STANDARD.encode(chunk.data),
+                })
+                .collect::<Vec<_>>();
+            if !events.is_empty() {
+                dispatch_async_event(dispatcher.clone(), AppEvent::FrontendEvents(events));
+            }
+        }
+    });
+}
+
+fn dispatch_pty_output(dispatcher: &AppDispatcher, pane_id: u32, data: &[u8]) {
+    if data.is_empty() {
+        return;
+    }
+    let output_tx = dispatcher
+        .state
+        .output_tx
+        .lock()
+        .ok()
+        .and_then(|sender| sender.clone());
+    if let Some(output_tx) = output_tx {
+        if output_tx
+            .send(PtyOutputChunk {
+                pane_id,
+                data: data.to_vec(),
+            })
+            .is_ok()
+        {
+            return;
+        }
+    }
+    dispatch_async_event(
+        dispatcher.clone(),
+        AppEvent::PtyOutput {
+            pane_id,
+            data_base64: STANDARD.encode(data),
+        },
+    );
 }
 
 fn handle_app_event(
@@ -540,7 +634,9 @@ fn handle_app_event(
             }
             Ok(message) => {
                 dispatch_runtime_events(dispatcher, |runtime| {
-                    runtime.app.handle_frontend_message(message, dispatcher.clone())
+                    runtime
+                        .app
+                        .handle_frontend_message(message, dispatcher.clone())
                 })?;
             }
             Err(error) => {
@@ -555,11 +651,9 @@ fn handle_app_event(
             dispatch_runtime_events(dispatcher, |_| events)?;
         }
         AppEvent::Ipc(command) => {
-            dispatch_runtime_events(dispatcher, |runtime| {
-                match command {
-                    IpcCommand::AddPane { cwd } => runtime.app.add_pane(cwd.map(PathBuf::from)),
-                    IpcCommand::NewTab { cwd } => runtime.app.create_tab(cwd.map(PathBuf::from)),
-                }
+            dispatch_runtime_events(dispatcher, |runtime| match command {
+                IpcCommand::AddPane { cwd } => runtime.app.add_pane(cwd.map(PathBuf::from)),
+                IpcCommand::NewTab { cwd } => runtime.app.create_tab(cwd.map(PathBuf::from)),
             })?;
         }
         AppEvent::PtyOutput {
@@ -591,7 +685,6 @@ impl VibeTerm {
             shell_profiles: available_shell_profiles(),
             active_shell: 0,
             settings: load_terminal_settings(),
-            font_families: system_font_families(),
             startup_directory,
             next_tab_id: 1,
             next_pane_id: 1,
@@ -604,7 +697,7 @@ impl VibeTerm {
             app_version: env!("CARGO_PKG_VERSION").to_owned(),
             font_family: self.settings.font_family.clone(),
             font_size: self.settings.font_size,
-            font_families: self.font_families.clone(),
+            font_families: default_font_families(),
         }
     }
 
@@ -621,14 +714,7 @@ impl VibeTerm {
                 rows,
                 pixel_width,
                 pixel_height,
-            } => self.start_pane(
-                pane_id,
-                cols,
-                rows,
-                pixel_width,
-                pixel_height,
-                dispatcher,
-            ),
+            } => self.start_pane(pane_id, cols, rows, pixel_width, pixel_height, dispatcher),
             FrontendMessage::Input { pane_id, data } => {
                 if let Err(error) = self.write_to_pane(pane_id, data.as_bytes()) {
                     return vec![FrontendEvent::Error {
@@ -644,8 +730,7 @@ impl VibeTerm {
                 pixel_width,
                 pixel_height,
             } => {
-                if let Err(error) =
-                    self.resize_pane(pane_id, cols, rows, pixel_width, pixel_height)
+                if let Err(error) = self.resize_pane(pane_id, cols, rows, pixel_width, pixel_height)
                 {
                     return vec![FrontendEvent::Error {
                         message: error.to_string(),
@@ -658,6 +743,10 @@ impl VibeTerm {
                 font_size,
             } => {
                 self.update_settings(font_family, font_size);
+                Vec::new()
+            }
+            FrontendMessage::LoadFontFamilies => {
+                load_font_families(dispatcher);
                 Vec::new()
             }
             FrontendMessage::CheckForUpdates { manual } => {
@@ -678,7 +767,9 @@ impl VibeTerm {
             }
             FrontendMessage::CopyToClipboard { text } => copy_to_clipboard(text),
             FrontendMessage::PasteFromClipboard { pane_id } => self.paste_from_clipboard(pane_id),
-            FrontendMessage::NewTerminal { cwd } => self.replace_active_pane(cwd.map(PathBuf::from)),
+            FrontendMessage::NewTerminal { cwd } => {
+                self.replace_active_pane(cwd.map(PathBuf::from))
+            }
             FrontendMessage::AddPane { cwd } => self.add_pane(cwd.map(PathBuf::from)),
             FrontendMessage::NewTab { cwd } => self.create_tab(cwd.map(PathBuf::from)),
             FrontendMessage::SelectTab { tab_id } => self.select_tab(tab_id),
@@ -1180,18 +1271,12 @@ fn spawn_terminal_session(
 
     let output_dispatcher = dispatcher.clone();
     thread::spawn(move || {
-        let mut buffer = [0u8; 8192];
+        let mut buffer = vec![0u8; PTY_READ_BUFFER_BYTES];
         loop {
             match reader.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(size) => {
-                    dispatch_async_event(
-                        output_dispatcher.clone(),
-                        AppEvent::PtyOutput {
-                            pane_id,
-                            data_base64: STANDARD.encode(&buffer[..size]),
-                        },
-                    );
+                    dispatch_pty_output(&output_dispatcher, pane_id, &buffer[..size]);
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(_) => break,
@@ -1537,22 +1622,27 @@ fn percent_decode(value: &str) -> String {
 }
 
 fn install_update(dispatcher: AppDispatcher, version: String, asset_url: String, silent: bool) {
-    thread::spawn(move || {
-        match download_and_launch_update(&version, &asset_url, silent) {
+    thread::spawn(
+        move || match download_and_launch_update(&version, &asset_url, silent) {
             Ok(()) => {
                 dispatch_async_event(
                     dispatcher.clone(),
-                    AppEvent::FrontendEvents(vec![FrontendEvent::UpdateInstallLaunched { version }]),
+                    AppEvent::FrontendEvents(vec![FrontendEvent::UpdateInstallLaunched {
+                        version,
+                    }]),
                 );
                 thread::sleep(Duration::from_millis(500));
                 shutdown_runtime(&dispatcher.state);
                 exit_app_after_delay(dispatcher.app_handle.clone());
             }
-            Err(error) => dispatch_async_event(dispatcher, AppEvent::FrontendEvents(vec![FrontendEvent::UpdateError {
-                message: format!("更新安装启动失败: {error}"),
-            }])),
-        }
-    });
+            Err(error) => dispatch_async_event(
+                dispatcher,
+                AppEvent::FrontendEvents(vec![FrontendEvent::UpdateError {
+                    message: format!("更新安装启动失败: {error}"),
+                }]),
+            ),
+        },
+    );
 }
 
 fn download_and_launch_update(version: &str, asset_url: &str, silent: bool) -> Result<()> {
@@ -1580,7 +1670,8 @@ fn download_and_launch_update(version: &str, asset_url: &str, silent: bool) -> R
         bail!("downloaded update file is unexpectedly small ({bytes_written} bytes)");
     }
     file.flush().ok();
-    file.sync_all().context("failed to flush update file to disk")?;
+    file.sync_all()
+        .context("failed to flush update file to disk")?;
     drop(file);
     validate_windows_executable(&download_path)?;
     let _ = fs::remove_file(&installer_path);
@@ -1684,6 +1775,30 @@ fn system_font_families() -> Vec<String> {
     }
 
     families.into_iter().collect()
+}
+
+fn default_font_families() -> Vec<String> {
+    [
+        "Cascadia Mono",
+        "Cascadia Code",
+        "Consolas",
+        "JetBrains Mono",
+        "Fira Code",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+fn load_font_families(dispatcher: AppDispatcher) {
+    thread::spawn(move || {
+        dispatch_async_event(
+            dispatcher,
+            AppEvent::FrontendEvents(vec![FrontendEvent::FontFamiliesLoaded {
+                font_families: system_font_families(),
+            }]),
+        );
+    });
 }
 
 fn load_terminal_settings() -> TerminalSettings {

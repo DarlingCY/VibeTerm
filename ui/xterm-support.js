@@ -75,6 +75,9 @@ function xtermCssLoaded() {
       return match ? match[1].trim() : '';
     }
 
+    const truecolorStyleOrder = [];
+    const maxTruecolorStyles = 256;
+
     function ensureTruecolorClass(kind, color) {
       const hex = cssColorToHex(color);
       if (!hex) {
@@ -83,11 +86,19 @@ function xtermCssLoaded() {
       const className = `vibeterm-${kind}-${hex}`;
       const styleId = `vibeterm-${kind}-style-${hex}`;
       if (!document.getElementById(styleId)) {
+        if (truecolorStyleOrder.length >= maxTruecolorStyles) {
+          const oldStyleId = truecolorStyleOrder.shift();
+          const oldStyle = oldStyleId ? document.getElementById(oldStyleId) : null;
+          if (oldStyle) {
+            oldStyle.remove();
+          }
+        }
         const style = document.createElement('style');
         style.id = styleId;
         const property = kind === 'bg' ? 'background-color' : 'color';
         style.textContent = `.xterm .${className}{${property}:#${hex} !important;}`;
         document.head.appendChild(style);
+        truecolorStyleOrder.push(styleId);
       }
       return className;
     }
@@ -307,4 +318,3 @@ function xtermCssLoaded() {
         handleTerminalClipboardShortcut(event, paneFromEventTarget(event.target));
       }, true);
     }
-

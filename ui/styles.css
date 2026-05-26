@@ -462,8 +462,23 @@
       line-height: 1;
     }
 
+    .pane-action.clone {
+      width: 24px;
+      height: 24px;
+      color: #98c379;
+      font-size: 14px;
+      font-weight: 700;
+    }
+
     .pane-action.add .pane-action-label {
       transform: translateY(-2px);
+    }
+
+    .pane-action.clone .pane-action-label {
+      height: 100%;
+      display: flex;
+      align-items: center;
+      transform: translateY(1px);
     }
 
     .pane-action:hover {
@@ -478,6 +493,10 @@
 
     .pane-action.add:hover {
       color: var(--accent);
+    }
+
+    .pane-action.clone:hover {
+      color: #b8e994;
     }
 
     .terminal {

@@ -32,12 +32,17 @@ function makePaneButton(className, title, text, onClick) {
         this.postStartResizeFrame = null;
         this.postStartResizeTimer = null;
         this.colorObserver = null;
+        this.outputQueue = [];
+        this.outputQueueBytes = 0;
+        this.outputFlushTimer = null;
+        this.outputWriteInFlight = false;
         this.lastFitCols = 0;
         this.lastFitRows = 0;
         this.lastFitPixelWidth = 0;
         this.lastFitPixelHeight = 0;
         this.exited = Boolean(event.exited);
         this.selection = '';
+        this.cwd = String(event.cwd || '').trim();
 
         this.element = document.createElement('section');
         this.element.className = 'pane';
@@ -56,11 +61,17 @@ function makePaneButton(className, title, text, onClick) {
             post({ type: 'addPane' });
           }
         });
+        this.cloneButton = makePaneButton('pane-action clone', '复制当前路径打开 Pane', '&#10697;', () => {
+          const activeTab = tabs.get(activeTabId);
+          if ((!activeTab || activeTab.panes.length < maxPanesPerTab) && this.cwd) {
+            post({ type: 'addPane', cwd: this.cwd });
+          }
+        });
         this.closeButton = makePaneButton('pane-action close', '关闭', '&#10005;', () => {
           post({ type: 'closePane', paneId: this.id });
         });
 
-        this.headerElement.append(this.cwdElement, this.addButton, this.closeButton);
+        this.headerElement.append(this.cwdElement, this.cloneButton, this.addButton, this.closeButton);
 
         this.terminalElement = document.createElement('div');
         this.terminalElement.className = 'terminal';
@@ -127,8 +138,10 @@ function makePaneButton(className, title, text, onClick) {
         this.term.open(this.terminalElement);
         this.opened = true;
         applyFontToTerminalElement(this.terminalElement);
-        this.installColorObserver();
-        normalizeXtermDomColors(this.terminalElement);
+        if (enableXtermDomColorNormalization) {
+          this.installColorObserver();
+          normalizeXtermDomColors(this.terminalElement);
+        }
       }
 
       installColorObserver() {
@@ -319,7 +332,22 @@ function makePaneButton(className, title, text, onClick) {
         this.clearDeferredFitTimer();
         this.clearPendingFitFrame();
         this.clearPostStartResize();
+        this.clearOutputFlushTimer();
         this.pendingForceBackendResize = false;
+      }
+
+      clearOutputFlushTimer() {
+        if (this.outputFlushTimer !== null) {
+          clearTimeout(this.outputFlushTimer);
+          this.outputFlushTimer = null;
+        }
+      }
+
+      clearTerminalWriteQueue() {
+        this.clearOutputFlushTimer();
+        this.outputQueue = [];
+        this.outputQueueBytes = 0;
+        this.outputWriteInFlight = false;
       }
 
       setActive(active) {
@@ -339,9 +367,12 @@ function makePaneButton(className, title, text, onClick) {
       syncControls(paneCount) {
         const closeHidden = paneCount <= 1;
         const addHidden = paneCount >= maxPanesPerTab;
+        const cloneHidden = addHidden || !this.cwd;
         this.closeButton.hidden = closeHidden;
+        this.cloneButton.hidden = cloneHidden;
         this.addButton.hidden = addHidden;
         this.closeButton.style.display = closeHidden ? 'none' : '';
+        this.cloneButton.style.display = cloneHidden ? 'none' : '';
         this.addButton.style.display = addHidden ? 'none' : '';
       }
 
@@ -366,7 +397,9 @@ function makePaneButton(className, title, text, onClick) {
         this.started = false;
         this.starting = false;
         this.clearPaneTimers();
+        this.clearTerminalWriteQueue();
         this.exited = false;
+        this.cwd = String(event.cwd || '').trim();
         this.selection = '';
         this.cwdElement.textContent = this.label();
         post({ type: 'selectionChanged', paneId: this.id, text: '' });
@@ -377,23 +410,71 @@ function makePaneButton(className, title, text, onClick) {
 
       write(dataBase64) {
         if (!this.opened) {
-          const chunks = pendingOutput.get(this.id) || [];
-          chunks.push(dataBase64);
-          pendingOutput.set(this.id, chunks);
+          queuePendingOutput(this.id, dataBase64);
           return;
         }
-        this.term.write(bytesFromBase64(dataBase64), () => {
-          normalizeXtermDomColors(this.terminalElement);
+        this.queueTerminalWrite(dataBase64);
+      }
+
+      queueTerminalWrite(dataBase64) {
+        const bytes = estimatedDecodedByteLength(dataBase64);
+        if (bytes <= 0) {
+          return;
+        }
+        this.outputQueue.push(dataBase64);
+        this.outputQueueBytes += bytes;
+        if (this.outputQueueBytes >= terminalWriteBatchMaxBytes) {
+          this.flushTerminalWriteQueue();
+          return;
+        }
+        this.scheduleTerminalWriteFlush();
+      }
+
+      scheduleTerminalWriteFlush() {
+        if (this.outputFlushTimer !== null || this.outputWriteInFlight) {
+          return;
+        }
+        this.outputFlushTimer = setTimeout(() => {
+          this.outputFlushTimer = null;
+          this.flushTerminalWriteQueue();
+        }, terminalWriteBatchDelayMs);
+      }
+
+      flushTerminalWriteQueue() {
+        if (this.outputWriteInFlight || this.outputQueue.length === 0 || !this.opened) {
+          return;
+        }
+        this.clearOutputFlushTimer();
+        const queue = this.outputQueue;
+        const totalBytes = this.outputQueueBytes;
+        this.outputQueue = [];
+        this.outputQueueBytes = 0;
+        const chunks = [];
+        let decodedBytes = 0;
+        for (const dataBase64 of queue) {
+          const bytes = bytesFromBase64(dataBase64);
+          chunks.push(bytes);
+          decodedBytes += bytes.length;
+        }
+        this.outputWriteInFlight = true;
+        this.term.write(concatenateBytes(chunks, decodedBytes || totalBytes), () => {
+          this.outputWriteInFlight = false;
+          if (this.outputQueue.length > 0) {
+            this.flushTerminalWriteQueue();
+          }
         });
       }
 
       flushPendingOutput() {
-        const chunks = pendingOutput.get(this.id);
-        if (!chunks) {
+        const pending = takePendingOutput(this.id);
+        if (!pending) {
           return;
         }
-        pendingOutput.delete(this.id);
-        for (const chunk of chunks) {
+        const droppedMessage = pendingOutputDroppedMessage(pending);
+        if (droppedMessage) {
+          this.term.write(droppedMessage);
+        }
+        for (const chunk of pending.chunks) {
           this.write(chunk);
         }
       }
@@ -402,12 +483,13 @@ function makePaneButton(className, title, text, onClick) {
         this.started = false;
         this.starting = false;
         this.clearPaneTimers();
+        this.clearTerminalWriteQueue();
         this.exited = true;
         this.cwdElement.textContent = this.label();
       }
 
       label() {
-        return `Pane#${this.id}`;
+        return this.cwd || `Pane#${this.id}`;
       }
 
       updateFont() {
@@ -425,10 +507,10 @@ function makePaneButton(className, title, text, onClick) {
           this.colorObserver.disconnect();
           this.colorObserver = null;
         }
+        this.clearTerminalWriteQueue();
         pendingOutput.delete(this.id);
         this.resizeObserver.disconnect();
         this.term.dispose();
         this.element.remove();
       }
     }
-

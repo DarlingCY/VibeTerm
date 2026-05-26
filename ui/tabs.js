@@ -199,9 +199,7 @@ function syncTabCloseButtons() {
     function writePane(event) {
       const pane = panes.get(event.paneId);
       if (!pane) {
-        const chunks = pendingOutput.get(event.paneId) || [];
-        chunks.push(event.dataBase64);
-        pendingOutput.set(event.paneId, chunks);
+        queuePendingOutput(event.paneId, event.dataBase64);
         return;
       }
       pane.write(event.dataBase64);
@@ -217,4 +215,3 @@ function syncTabCloseButtons() {
     function isTitlebarInteractive(target) {
       return Boolean(target.closest('button, #newTabButton, #tabBar, #windowControls'));
     }
-

@@ -26,6 +26,20 @@ function quoteFontFamily(fontFamily) {
       syncFontSelect();
     }
 
+    function loadSystemFontsOnce() {
+      if (systemFontsLoaded || systemFontsLoading) {
+        return;
+      }
+      systemFontsLoading = true;
+      post({ type: 'loadFontFamilies' });
+    }
+
+    function applyLoadedFontFamilies(fontFamilies) {
+      systemFontsLoaded = true;
+      systemFontsLoading = false;
+      populateFontSelect(fontFamilies);
+    }
+
     function syncFontSelect() {
       if (!Array.from(terminalFontSelect.options).some(option => option.value === terminalSettings.fontFamily)) {
         const option = document.createElement('option');
@@ -90,6 +104,7 @@ function quoteFontFamily(fontFamily) {
     function setSettingsOpen(open) {
       settingsPanel.hidden = !open;
       if (open) {
+        loadSystemFontsOnce();
         syncSettingsControls();
         terminalFontSelect.focus();
       }
@@ -114,4 +129,3 @@ function quoteFontFamily(fontFamily) {
       persistSettings();
       requestAnimationFrame(fitVisiblePanes);
     }
-
