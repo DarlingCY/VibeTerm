@@ -47,7 +47,18 @@ const tabs = new Map();
     let updateInstallInFlight = false;
     let updateButtonMode = 'check';
 
-    function estimatedDecodedByteLength(dataBase64) {
+    function decodedOutputItem(dataBase64) {
+      const bytes = bytesFromBase64(dataBase64);
+      if (bytes.length <= 0) {
+        return null;
+      }
+      return {
+        bytes,
+        byteLength: bytes.length,
+      };
+    }
+
+    function outputByteLengthFromBase64(dataBase64) {
       const value = String(dataBase64 || '');
       if (!value) {
         return 0;
@@ -56,23 +67,60 @@ const tabs = new Map();
       return Math.max(0, Math.floor(value.length * 3 / 4) - padding);
     }
 
-    function queuePendingOutput(paneId, dataBase64) {
-      const bytes = estimatedDecodedByteLength(dataBase64);
+    function rawOutputItem(dataBase64) {
+      const byteLength = outputByteLengthFromBase64(dataBase64);
+      return byteLength > 0 ? { dataBase64, byteLength } : null;
+    }
+
+    function ensureDecodedOutputItem(item) {
+      if (!item || item.bytes) {
+        return item || null;
+      }
+      return decodedOutputItem(item.dataBase64);
+    }
+
+    function outputItemByteLength(item) {
+      return item && typeof item.byteLength === 'number' ? item.byteLength : 0;
+    }
+
+    function compactPendingChunks(pending) {
+      if (pending.start > 0 && (pending.start > 64 || pending.start * 2 > pending.chunks.length)) {
+        pending.chunks = pending.chunks.slice(pending.start);
+        pending.start = 0;
+      }
+    }
+
+    function dropOldestPendingChunk(pending) {
+      if (!pending || pending.start >= pending.chunks.length) {
+        return 0;
+      }
+      const dropped = pending.chunks[pending.start];
+      pending.start += 1;
+      const droppedBytes = outputItemByteLength(dropped);
+      pending.bytes = Math.max(0, pending.bytes - droppedBytes);
+      pending.droppedBytes += droppedBytes;
+      compactPendingChunks(pending);
+      return droppedBytes;
+    }
+
+    function pendingChunkCount(pending) {
+      return pending && pending.chunks ? Math.max(0, pending.chunks.length - (pending.start || 0)) : 0;
+    }
+
+    function queuePendingOutput(paneId, item) {
+      const bytes = outputItemByteLength(item);
       if (bytes <= 0) {
         return;
       }
       let pending = pendingOutput.get(paneId);
       if (!pending) {
-        pending = { chunks: [], bytes: 0, droppedBytes: 0 };
+        pending = { chunks: [], start: 0, bytes: 0, droppedBytes: 0 };
         pendingOutput.set(paneId, pending);
       }
-      pending.chunks.push(dataBase64);
+      pending.chunks.push(item);
       pending.bytes += bytes;
-      while (pending.bytes > pendingOutputMaxBytes && pending.chunks.length > 0) {
-        const dropped = pending.chunks.shift();
-        const droppedBytes = estimatedDecodedByteLength(dropped);
-        pending.bytes = Math.max(0, pending.bytes - droppedBytes);
-        pending.droppedBytes += droppedBytes;
+      while (pending.bytes > pendingOutputMaxBytes && pendingChunkCount(pending) > 0) {
+        dropOldestPendingChunk(pending);
       }
       capPendingOutputGlobal();
     }
@@ -85,16 +133,13 @@ const tabs = new Map();
       while (totalBytes > pendingOutputGlobalMaxBytes) {
         let droppedAny = false;
         for (const [paneId, pending] of pendingOutput.entries()) {
-          if (!pending.chunks || pending.chunks.length === 0) {
+          if (pendingChunkCount(pending) === 0) {
             if ((pending.bytes || 0) <= 0) {
               pendingOutput.delete(paneId);
             }
             continue;
           }
-          const dropped = pending.chunks.shift();
-          const droppedBytes = estimatedDecodedByteLength(dropped);
-          pending.bytes = Math.max(0, pending.bytes - droppedBytes);
-          pending.droppedBytes += droppedBytes;
+          const droppedBytes = dropOldestPendingChunk(pending);
           totalBytes = Math.max(0, totalBytes - droppedBytes);
           droppedAny = true;
           break;
@@ -127,7 +172,7 @@ const tabs = new Map();
       for (const [paneId, pending] of pendingOutput.entries()) {
         totalBytes += pending.bytes || 0;
         totalDroppedBytes += pending.droppedBytes || 0;
-        entries.push(`pane#${paneId}:bytes=${pending.bytes || 0},dropped=${pending.droppedBytes || 0},chunks=${pending.chunks ? pending.chunks.length : 0}`);
+        entries.push(`pane#${paneId}:bytes=${pending.bytes || 0},dropped=${pending.droppedBytes || 0},chunks=${pendingChunkCount(pending)}`);
       }
       return `pendingOutput panes=${pendingOutput.size} bytes=${totalBytes} dropped=${totalDroppedBytes}${entries.length ? ` [${entries.join('; ')}]` : ''}`;
     }

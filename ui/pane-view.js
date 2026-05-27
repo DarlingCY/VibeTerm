@@ -38,6 +38,7 @@ function makePaneButton(className, title, text, onClick) {
         this.outputFlushTimer = null;
         this.outputWriteInFlight = false;
         this.pendingReplayChunks = [];
+        this.pendingReplayStart = 0;
         this.pendingReplayFrame = null;
         this.lastFitCols = 0;
         this.lastFitRows = 0;
@@ -47,11 +48,6 @@ function makePaneButton(className, title, text, onClick) {
         this.selection = '';
         this.cwd = String(event.cwd || '').trim();
         this.paneIndex = null;
-        this.ansiSequenceTail = '';
-        this.ansiAlternateScreen = false;
-        this.ansiMouseTracking = false;
-        this.ansiDecoder = new TextDecoder();
-
         this.element = document.createElement('section');
         this.element.className = 'pane';
         this.element.dataset.paneId = String(this.id);
@@ -102,10 +98,10 @@ function makePaneButton(className, title, text, onClick) {
         }
         if (window.ClipboardAddon && typeof window.ClipboardAddon.ClipboardAddon === 'function') {
           this.clipboardAddon = new window.ClipboardAddon.ClipboardAddon(undefined, {
-            readText: () => navigator.clipboard ? navigator.clipboard.readText() : Promise.resolve(''),
+            readText: () => Promise.resolve(''),
             writeText: (_selection, data) => {
               post({ type: 'copyToClipboard', text: data || this.currentSelection() });
-              return navigator.clipboard ? navigator.clipboard.writeText(data || this.currentSelection()).catch(() => {}) : Promise.resolve();
+              return Promise.resolve();
             },
           });
           this.term.loadAddon(this.clipboardAddon);
@@ -156,10 +152,6 @@ function makePaneButton(className, title, text, onClick) {
           return;
         }
         post({ type: 'input', paneId: this.id, data });
-      }
-
-      hasInteractiveControlMode() {
-        return this.ansiAlternateScreen || this.ansiMouseTracking || terminalHasInteractiveControlMode(this.term);
       }
 
       openTerminal() {
@@ -360,6 +352,7 @@ function makePaneButton(className, title, text, onClick) {
           this.pendingReplayFrame = null;
         }
         this.pendingReplayChunks = [];
+        this.pendingReplayStart = 0;
         this.outputQueue = [];
         this.outputQueueBytes = 0;
         this.outputWriteInFlight = false;
@@ -397,10 +390,14 @@ function makePaneButton(className, title, text, onClick) {
 
       focus(notify) {
         activePaneId = this.id;
-        for (const pane of panes.values()) {
-          const tab = tabs.get(pane.tabId);
-          const canShowActive = tab && tab.panes.length > 1;
-          pane.setActive(canShowActive && pane.id === this.id);
+        const tab = tabs.get(this.tabId);
+        const paneIds = tab ? tab.panes : [];
+        const canShowActive = paneIds.length > 1;
+        for (const paneId of paneIds) {
+          const pane = panes.get(paneId);
+          if (pane) {
+            pane.setActive(canShowActive && pane.id === this.id);
+          }
         }
         if (this.tabId === activeTabId) {
           this.activate();
@@ -420,51 +417,27 @@ function makePaneButton(className, title, text, onClick) {
         this.exited = false;
         this.cwd = String((event && event.cwd) || '').trim();
         this.selection = '';
-        this.ansiSequenceTail = '';
-        this.ansiAlternateScreen = false;
-        this.ansiMouseTracking = false;
         this.cwdElement.textContent = this.label();
         this.term.reset();
         this.term.clear();
         this.scheduleFitAndStart();
       }
 
-      write(dataBase64) {
+      write(item) {
         if (!this.opened || !this.visible) {
-          queuePendingOutput(this.id, dataBase64);
+          queuePendingOutput(this.id, item);
           return;
         }
-        this.trackTerminalControlSequences(dataBase64);
-        this.queueTerminalWrite(dataBase64);
+        this.queueTerminalWrite(item);
       }
 
-      trackTerminalControlSequences(dataBase64) {
-        const bytes = bytesFromBase64(dataBase64);
-        if (!bytes.length) {
-          return;
-        }
-        const text = this.ansiSequenceTail + this.ansiDecoder.decode(bytes);
-        const privateModePattern = /\x1b\[\?([0-9;]*)([hl])/g;
-        let match;
-        while ((match = privateModePattern.exec(text)) !== null) {
-          const enabled = match[2] === 'h';
-          const modes = match[1].split(';').map(value => Number(value));
-          if (modes.some(mode => mode === 1047 || mode === 1048 || mode === 1049)) {
-            this.ansiAlternateScreen = enabled;
-          }
-          if (modes.some(mode => mode === 1000 || mode === 1002 || mode === 1003 || mode === 1005 || mode === 1006 || mode === 1015)) {
-            this.ansiMouseTracking = enabled;
-          }
-        }
-        this.ansiSequenceTail = text.slice(-128);
-      }
-
-      queueTerminalWrite(dataBase64) {
-        const bytes = estimatedDecodedByteLength(dataBase64);
+      queueTerminalWrite(item) {
+        item = ensureDecodedOutputItem(item);
+        const bytes = outputItemByteLength(item);
         if (bytes <= 0) {
           return;
         }
-        this.outputQueue.push(dataBase64);
+        this.outputQueue.push(item);
         this.outputQueueBytes += bytes;
         if (this.outputQueueBytes >= terminalWriteBatchMaxBytes) {
           this.flushTerminalWriteQueue();
@@ -494,10 +467,9 @@ function makePaneButton(className, title, text, onClick) {
         this.outputQueueBytes = 0;
         const chunks = [];
         let decodedBytes = 0;
-        for (const dataBase64 of queue) {
-          const bytes = bytesFromBase64(dataBase64);
-          chunks.push(bytes);
-          decodedBytes += bytes.length;
+        for (const item of queue) {
+          chunks.push(item.bytes);
+          decodedBytes += item.byteLength;
         }
         this.outputWriteInFlight = true;
         this.term.write(concatenateBytes(chunks, decodedBytes || totalBytes), () => {
@@ -517,14 +489,14 @@ function makePaneButton(className, title, text, onClick) {
         if (droppedMessage) {
           this.term.write(droppedMessage);
         }
-        if (pending.chunks && pending.chunks.length > 0) {
-          this.pendingReplayChunks.push(...pending.chunks);
+        if (pendingChunkCount(pending) > 0) {
+          this.pendingReplayChunks.push(...pending.chunks.slice(pending.start || 0));
           this.schedulePendingReplay();
         }
       }
 
       schedulePendingReplay() {
-        if (this.pendingReplayFrame !== null || this.pendingReplayChunks.length === 0) {
+        if (this.pendingReplayFrame !== null || this.pendingReplayStart >= this.pendingReplayChunks.length) {
           return;
         }
         this.pendingReplayFrame = requestAnimationFrame(() => {
@@ -534,16 +506,25 @@ function makePaneButton(className, title, text, onClick) {
       }
 
       replayPendingOutputBatch() {
-        if (!this.opened || !this.visible || this.pendingReplayChunks.length === 0) {
+        if (!this.opened || !this.visible || this.pendingReplayStart >= this.pendingReplayChunks.length) {
           return;
         }
         let replayedBytes = 0;
-        while (this.pendingReplayChunks.length > 0 && replayedBytes < terminalWriteBatchMaxBytes) {
-          const chunk = this.pendingReplayChunks.shift();
-          replayedBytes += estimatedDecodedByteLength(chunk);
+        while (this.pendingReplayStart < this.pendingReplayChunks.length && replayedBytes < terminalWriteBatchMaxBytes) {
+          const chunk = this.pendingReplayChunks[this.pendingReplayStart];
+          this.pendingReplayStart += 1;
+          replayedBytes += outputItemByteLength(chunk);
           this.write(chunk);
+          if (this.pendingReplayStart > 64 && this.pendingReplayStart * 2 > this.pendingReplayChunks.length) {
+            this.pendingReplayChunks = this.pendingReplayChunks.slice(this.pendingReplayStart);
+            this.pendingReplayStart = 0;
+          }
         }
-        if (this.pendingReplayChunks.length > 0) {
+        if (this.pendingReplayStart >= this.pendingReplayChunks.length) {
+          this.pendingReplayChunks = [];
+          this.pendingReplayStart = 0;
+        }
+        if (this.pendingReplayStart < this.pendingReplayChunks.length) {
           this.schedulePendingReplay();
         }
       }
@@ -555,9 +536,6 @@ function makePaneButton(className, title, text, onClick) {
         this.clearTerminalWriteQueue();
         this.exited = true;
         this.visible = false;
-        this.ansiSequenceTail = '';
-        this.ansiAlternateScreen = false;
-        this.ansiMouseTracking = false;
         this.cwdElement.textContent = this.label();
       }
 

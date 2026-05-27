@@ -21,7 +21,7 @@ use arboard::Clipboard;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow, Window, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow, WindowEvent};
 
 const IPC_PORT: u16 = 15973;
 const IPC_HOST: &str = "127.0.0.1";
@@ -491,7 +491,6 @@ fn run_main_instance(startup_directory: Option<PathBuf>) -> Result<()> {
                 let _ = window.hide();
                 exit_app_after_delay(window.app_handle().clone());
             }
-            WindowEvent::Resized(_) => emit_window_state(window),
             WindowEvent::Destroyed => {
                 let state = window.state::<AppState>();
                 shutdown_runtime(state.inner());
@@ -598,15 +597,6 @@ fn emit_frontend_event(dispatcher: &AppDispatcher, event: &FrontendEvent) {
 
     if let Err(error) = window.emit(FRONTEND_EVENT_NAME, event) {
         eprintln!("failed to emit frontend event: {error}");
-    }
-}
-
-fn emit_window_state(window: &Window) {
-    let event = FrontendEvent::WindowState {
-        maximized: window.is_maximized().unwrap_or(false),
-    };
-    if let Err(error) = window.emit(FRONTEND_EVENT_NAME, &event) {
-        eprintln!("failed to emit window state: {error}");
     }
 }
 
@@ -1242,7 +1232,6 @@ impl VibeTerm {
             return Ok(());
         };
         writer.write_all(bytes).context("failed to write to PTY")?;
-        writer.flush().ok();
         Ok(())
     }
 

@@ -120,31 +120,6 @@
       };
     }
 
-    function terminalUsesAlternateScreen(term) {
-      try {
-        if (term && term.buffer && term.buffer.active && term.buffer.active.type === 'alternate') {
-          return true;
-        }
-        return Boolean(term && term._core && term._core.buffers &&
-          term._core.buffers.active === term._core.buffers.alt);
-      } catch (error) {
-        return false;
-      }
-    }
-
-    function terminalMouseTrackingMode(term) {
-      try {
-        return term && term.modes ? term.modes.mouseTrackingMode : 'none';
-      } catch (error) {
-        return 'none';
-      }
-    }
-
-    function terminalHasInteractiveControlMode(term) {
-      const mouseMode = terminalMouseTrackingMode(term);
-      return terminalUsesAlternateScreen(term) || (mouseMode && mouseMode !== 'none');
-    }
-
     function wheelLineCount(event) {
       const rawDelta = Math.abs(event.deltaY || 0);
       if (rawDelta === 0) {

@@ -96,6 +96,9 @@ function syncTabCloseButtons() {
       if (!tab) {
         return;
       }
+      if (activeTabId === tabId && tab.content.classList.contains('active')) {
+        return;
+      }
       activeTabId = tabId;
       for (const existing of tabs.values()) {
         const active = existing.id === tabId;
@@ -140,7 +143,12 @@ function syncTabCloseButtons() {
       if (!pane) {
         return;
       }
-      selectTab(pane.tabId);
+      if (activePaneId === paneId && activeTabId === pane.tabId) {
+        return;
+      }
+      if (activeTabId !== pane.tabId) {
+        selectTab(pane.tabId);
+      }
       pane.focus(false);
     }
 
@@ -192,10 +200,18 @@ function syncTabCloseButtons() {
     function writePane(event) {
       const pane = panes.get(event.paneId);
       if (!pane) {
-        queuePendingOutput(event.paneId, event.dataBase64);
+        const item = rawOutputItem(event.dataBase64);
+        if (!item) {
+          return;
+        }
+        queuePendingOutput(event.paneId, item);
         return;
       }
-      pane.write(event.dataBase64);
+      const item = pane.opened && pane.visible ? decodedOutputItem(event.dataBase64) : rawOutputItem(event.dataBase64);
+      if (!item) {
+        return;
+      }
+      pane.write(item);
     }
 
     function markExited(event) {
