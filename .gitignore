@@ -4,4 +4,4 @@
 /dist
 /gen
 /installer/Output
-/ui/vendor
+.slim/deepwork/
