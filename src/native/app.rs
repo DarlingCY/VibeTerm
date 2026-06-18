@@ -6,7 +6,7 @@ use std::io::Write;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{mpsc, Arc, Mutex};
 
-use iced::widget::{canvas, container, pane_grid, text, PaneGrid};
+use iced::widget::{button, canvas, column, container, pane_grid, row, text, PaneGrid};
 use iced::{Element, Length, Subscription, Task};
 
 use crate::pty::{pty_size, spawn_terminal_session, PtyEventSink, TerminalSession};
@@ -398,9 +398,17 @@ impl App {
         .on_click(Message::PaneClicked)
         .on_drag(Message::PaneDragged);
 
-        container(grid)
+        let toolbar = row![
+            button(text("横向分屏")).on_press(Message::SplitFocused(pane_grid::Axis::Horizontal)),
+            button(text("纵向分屏")).on_press(Message::SplitFocused(pane_grid::Axis::Vertical)),
+            button(text("关闭当前 Pane")).on_press(Message::CloseFocused),
+        ]
+        .spacing(8);
+
+        container(column![toolbar, grid].spacing(8))
             .width(Length::Fill)
             .height(Length::Fill)
+            .padding(8)
             .into()
     }
 
